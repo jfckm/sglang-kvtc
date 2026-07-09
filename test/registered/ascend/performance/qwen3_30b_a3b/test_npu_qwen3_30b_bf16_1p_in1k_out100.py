@@ -1,4 +1,7 @@
+import requests
 import unittest
+import pandas as pd
+from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
@@ -100,8 +103,9 @@ OTHER_ARGS = [
     "qwen",
 ]
 
+KVTC_DATASET_PATH = Path("/root/.cache/KVTC/datasets")
 
-class TestQwen32B(TestAscendPerformanceTestCaseBase):
+class TestKVTCQwen30B(TestAscendPerformanceTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_30B_A3B_MODEL_PATH
@@ -118,7 +122,47 @@ class TestQwen32B(TestAscendPerformanceTestCaseBase):
     output_token_throughput = 2047.81
     max_attempts = 4
 
-    def test_qwen3_32b(self):
+    def _download_dataset(self, name: str, remote_address: str):
+        download_path = KVTC_DATASET_PATH
+        download_path.mkdir(parents=True, exist_ok=True)
+
+        proxies = {
+                "http": None,
+                "https": None,
+                }
+
+        ret = requests.get(remote_address, verify=False, proxies=proxies)
+        # print download stats 
+
+        file_path = download_path / name
+        with open(file_path, "wb") as f:
+            f.write(ret.content)
+
+        return file_path
+
+#    def test_kvtc_qwen3_30b_generate_openmath_dumps(self):
+#        remote_address = "https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/main/data/CC-MAIN-2025-26/000_00000.parquet"
+#
+#        openmath_path = _download_dataset("openmath", remote_address)
+#        openmath_dataset = pd.read_parquet(file_path)
+
+
+    def test_kvtc_qwen3_30b_generate_openmath_dumps(self):
+        remote_address = "https://huggingface.co/datasets/nvidia/OpenMathReasoning/resolve/main/data/additional_problems-00000-of-00001.parquet"
+
+        openmath_path = self._download_dataset("openmath", remote_address)
+
+        openmath_dataset = pd.read_parquet(file_path).iloc
+
+        for idx in prompt_indices:
+            print(openmath_dataset[idx])
+
+        for entry in openmath_dataset:
+            print(f"{entry=}")
+
+        import pdb
+        pdb.set_trace()
+
         self.run_throughput()
 
 
