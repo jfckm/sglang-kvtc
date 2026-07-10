@@ -866,6 +866,7 @@ def assert_metrics(self, metrics):
         )
 
 
+# This is the base class
 class TestAscendPerformanceTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -928,6 +929,7 @@ class TestAscendPerformanceTestCaseBase(CustomTestCase):
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
 
+    # This is the function that the test is running
     @retry()
     def run_throughput(self):
         parsed_url = urlparse(self.base_url)
