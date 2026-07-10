@@ -1,6 +1,8 @@
 import requests
 import unittest
+import openai
 import pandas as pd
+from urllib.parse import urlparse
 from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
@@ -154,14 +156,33 @@ class TestKVTCQwen30B(TestAscendPerformanceTestCaseBase):
 
         openmath_dataset = pd.read_parquet(file_path).iloc
 
-        for idx in prompt_indices:
-            print(openmath_dataset[idx])
+#        for idx in prompt_indices:
+#            print(openmath_dataset[idx])
 
         for entry in openmath_dataset:
             print(f"{entry=}")
 
         import pdb
         pdb.set_trace()
+
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+
+        print(parsed_url)
+
+        client = openai.Client(base_url=f"http://{host}:{port}/v1", api_key="None")
+
+        response = client.chat.completions.create(
+                model="Qwen3-30B-A3B",
+                messages = [
+                    {"role": "user", "content": "Who is the maintainer of Open CAS Linux"},
+                    ]
+                temperature=0,
+                max_tokens=64,
+                )
+
+        print(f"The server responed with {response}")
 
         self.run_throughput()
 
