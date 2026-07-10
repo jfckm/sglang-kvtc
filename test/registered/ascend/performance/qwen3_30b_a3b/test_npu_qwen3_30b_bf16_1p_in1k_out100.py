@@ -142,16 +142,26 @@ class TestKVTCQwen30B(TestAscendPerformanceTestCaseBase):
 
         openmath_path = self._download_dataset("openmath", remote_address)
 
-        openmath_dataset = pd.read_parquet(file_path).iloc
+        openmath_dataset = pd.read_parquet(openmath_path).iloc
+
+        client = openai.Client(base_url=f"http://{host}:{port}/v1", api_key="None")
 
 #        for idx in prompt_indices:
 #            print(openmath_dataset[idx])
 
-        for entry in openmath_dataset:
-            print(f"{entry=}")
+        for i, entry in enumerate(openmath_dataset):
+            if i > 10:
+                break
 
-        import pdb
-        pdb.set_trace()
+            response = client.chat.completions.create(
+                    model="Qwen3-30B-A3B",
+                    messages = [
+                            {"role": "user", "content": entry["problem"]},
+                        ],
+                    temperature=0,
+                    )
+
+            print(f"The server responed with {response}")
 
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
@@ -159,20 +169,9 @@ class TestKVTCQwen30B(TestAscendPerformanceTestCaseBase):
 
         print(parsed_url)
 
-        client = openai.Client(base_url=f"http://{host}:{port}/v1", api_key="None")
 
-        response = client.chat.completions.create(
-                model="Qwen3-30B-A3B",
-                messages = [
-                    {"role": "user", "content": "Who is the maintainer of Open CAS Linux"},
-                    ]
-                temperature=0,
-                max_tokens=64,
-                )
 
-        print(f"The server responed with {response}")
-
-        self.run_throughput()
+        #self.run_throughput()
 
 
 if __name__ == "__main__":
