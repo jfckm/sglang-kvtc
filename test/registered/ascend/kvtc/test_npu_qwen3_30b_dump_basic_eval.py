@@ -119,7 +119,7 @@ class TestKVTCQwen30B_dump_openmath_smoke(TestAscendPerformanceKvtcTestCaseBase)
     model = QWEN3_30B_A3B_MODEL_PATH
     other_args = OTHER_ARGS + [
         "--dump-kv-path",
-        KVTC_CACHE_PATH / "/openmath_dump",
+        KVTC_CACHE_PATH / "openmath_dump",
     ]
     envs = ENVS
     kvtc_dataset_name = "openmath"
@@ -141,7 +141,7 @@ class TestKVTCQwen30B_dump_fineweb_smoke(TestAscendPerformanceKvtcTestCaseBase):
     model = QWEN3_30B_A3B_MODEL_PATH
     other_args = OTHER_ARGS + [
         "--dump-kv-path",
-        KVTC_CACHE_PATH / "/fineweb_dump",
+        KVTC_CACHE_PATH / "fineweb_dump",
     ]
     envs = ENVS
     kvtc_dataset_name = "fineweb"
@@ -164,7 +164,7 @@ class TestKVTCQwen30B_dump_openmath(TestAscendPerformanceKvtcTestCaseBase):
     model = QWEN3_30B_A3B_MODEL_PATH
     other_args = OTHER_ARGS + [
         "--dump-kv-path",
-        KVTC_CACHE_PATH / "/openmath_dump",
+        KVTC_CACHE_PATH / "openmath_dump",
     ]
     envs = ENVS
     kvtc_dataset_name = "openmath"
@@ -187,7 +187,7 @@ class TestKVTCQwen30B_dump_fineweb(TestAscendPerformanceKvtcTestCaseBase):
     model = QWEN3_30B_A3B_MODEL_PATH
     other_args = OTHER_ARGS + [
         "--dump-kv-path",
-        KVTC_CACHE_PATH / "/fineweb_dump",
+        KVTC_CACHE_PATH / "fineweb_dump",
     ]
     envs = ENVS
     kvtc_dataset_name = "fineweb"
