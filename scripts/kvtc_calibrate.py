@@ -23,7 +23,7 @@ from sglang.srt.server_args import (
        set_global_server_args_for_scheduler
     )
 from transformers import AutoConfig
-from collections import defaultdict
+from collections import Counter, defaultdict
 from enum import Enum, IntEnum
 
 logger = logging.getLogger()
@@ -171,53 +171,117 @@ def count_tokens(datasets_list):
 
 
 def load_tensor(paths):
-    # Each prefix is chunked in two dimensions: by layer and by tokens
-    # To make sure we don't mix up any dimensions, we first stack all layers that belong
-    # to one chunk and then we concatenate them by tokens
-    chunk_count = len([p for p in paths if "layer_0" in str(p)])
+    """Load one request only when every chunk has the same complete layer set."""
+    if not paths:
+        logger.warning("Discarding empty dump request")
+        return None, None
 
-    ret = None
-    for chunk_id in range(chunk_count):
-        layers = [p for p in paths if f"chunk_{chunk_id}" in str(p)]
-        layers.sort(key=tensor_sorting_fn)
+    request_path = paths[0].parent
+    request_name = paths[0].name.split("-K-", 1)[0].split("-V-", 1)[0]
+    chunks = defaultdict(dict)
+    for path in paths:
+        match = re.search(r"chunk_(\d+)-layer_(\d+)\.bin$", path.name)
+        if match is None:
+            logger.warning("Discarding %s: unrecognized dump filename %s", request_name, path)
+            return None, None
 
-        layer_tensors = []
-        all_layers_loaded = True
-        for l in layers:
-            try:
-                layer_tensors.append(torch.load(l, map_location="cpu"))
-            except:
-                logger.warning(f"Skipping {l} -- file corrupted")
-                all_layers_loaded = False
+        chunk_id, layer_id = map(int, match.groups())
+        if layer_id in chunks[chunk_id]:
+            logger.warning(
+                "Discarding %s: duplicate layer %s in chunk %s at %s",
+                request_name,
+                layer_id,
+                chunk_id,
+                request_path,
+            )
+            return None, None
+        chunks[chunk_id][layer_id] = path
 
-        if not all_layers_loaded:
-            continue
+    chunk_ids = sorted(chunks)
+    if chunk_ids != list(range(len(chunk_ids))):
+        logger.warning(
+            "Discarding %s: non-contiguous chunk IDs %s at %s",
+            request_name,
+            chunk_ids,
+            request_path,
+        )
+        return None, None
+
+    expected_layer_ids = None
+    chunk_tensors = []
+    for chunk_id in chunk_ids:
+        layer_ids = sorted(chunks[chunk_id])
+        if expected_layer_ids is None:
+            expected_layer_ids = layer_ids
+        elif layer_ids != expected_layer_ids:
+            logger.warning(
+                "Discarding %s: chunk %s has layers %s, expected %s at %s",
+                request_name,
+                chunk_id,
+                layer_ids,
+                expected_layer_ids,
+                request_path,
+            )
+            return None, None
 
         try:
+            layer_tensors = [
+                torch.load(chunks[chunk_id][layer_id], map_location="cpu")
+                for layer_id in layer_ids
+            ]
             chunk = torch.stack(layer_tensors)
-        except RuntimeError as e:
-            logger.error(str(e))
-            logger.error(f"Chunk {chunk_id} from {paths[0]} corrupted, discarding")
-            continue
-        # Now chunk is 4d tensor [layer, token, head, h_dim]
+        except Exception as error:
+            logger.warning(
+                "Discarding %s: cannot load chunk %s at %s: %s",
+                request_name,
+                chunk_id,
+                request_path,
+                error,
+            )
+            return None, None
 
-        if ret == None:
-            ret = chunk
-        else:
-            try:
-                ret = torch.concat([ret, chunk], dim=1)
-            except RuntimeError as e:
-                logger.error(str(e))
-                logger.error(f"Request from {paths[0]} corrupted, discarding all")
-                return None, None
-                
+        if chunk.ndim != 4:
+            logger.warning(
+                "Discarding %s: chunk %s has shape %s, expected [layer, token, head, head_dim]",
+                request_name,
+                chunk_id,
+                tuple(chunk.shape),
+            )
+            return None, None
+        if chunk_tensors and (
+            chunk.shape[0] != chunk_tensors[0].shape[0]
+            or chunk.shape[2:] != chunk_tensors[0].shape[2:]
+            or chunk.dtype != chunk_tensors[0].dtype
+        ):
+            logger.warning(
+                "Discarding %s: chunk %s shape/dtype %s/%s differs from %s/%s",
+                request_name,
+                chunk_id,
+                tuple(chunk.shape),
+                chunk.dtype,
+                tuple(chunk_tensors[0].shape),
+                chunk_tensors[0].dtype,
+            )
+            return None, None
+        chunk_tensors.append(chunk)
 
-    # Make the output tensor token first
-    ret = ret.transpose(0, 1)
+    try:
+        ret = torch.concat(chunk_tensors, dim=1).transpose(0, 1)
+    except RuntimeError as error:
+        logger.warning(
+            "Discarding %s: cannot combine validated chunks at %s: %s",
+            request_name,
+            request_path,
+            error,
+        )
+        return None, None
+    if ret.dtype != torch.bfloat16:
+        logger.warning(
+            "Discarding %s: dtype %s, expected torch.bfloat16", request_name, ret.dtype
+        )
+        return None, None
 
-    assert ret.dtype == torch.bfloat16
-
-    logger.info(f"Loaded {ret.shape}")
+    logger.info("Loaded %s from %s", tuple(ret.shape), request_name)
 
     torch.cpu.synchronize()
 
@@ -243,11 +307,24 @@ def sample_tokens(tensor, sampling_budget):
 
 
 def transform_tensors(tensors):
-    tensors = [t for t in tensors if t.shape == tensors[0].shape]
+    if not tensors:
+        raise ValueError("No valid calibration tensors were loaded")
 
-    ret = torch.concat(tensors)
-    token_count = ret.shape[0]
-    ret = ret.view(token_count, -1)
+    feature_shapes = Counter(tensor.shape[1:] for tensor in tensors)
+    feature_shape, _ = feature_shapes.most_common(1)[0]
+    valid_tensors = [tensor for tensor in tensors if tensor.shape[1:] == feature_shape]
+    discarded = len(tensors) - len(valid_tensors)
+    if discarded:
+        logger.warning(
+            "Discarding %s sampled tensors with non-canonical feature shapes; "
+            "using %s from %s tensors",
+            discarded,
+            feature_shape,
+            len(valid_tensors),
+        )
+        logger.warning("Observed sampled feature shapes: %s", dict(feature_shapes))
+
+    ret = torch.concat(valid_tensors, dim=0).flatten(start_dim=1)
 
     torch.cpu.synchronize()
 
@@ -328,8 +405,28 @@ class TensorFileManager(object):
         buckets = {b: 0 for b in TensorFileManager.Sequence}
         logger.info(f"Looking for {kv} tensors at {tensor_dir / tp_pp_worker}")
         for fg in file_groups:
-            chunks = [f for f in fg if "layer_0" in str(f)]
-            token_count = torch.concat([torch.load(p, map_location="cpu") for p in chunks]).shape[0]
+            chunks = [
+                path
+                for path in fg
+                if re.search(r"chunk_\d+-layer_0\.bin$", path.name)
+            ]
+            if not chunks:
+                logger.warning(
+                    "Skipping request %s during discovery: no layer-0 dump files",
+                    fg[0] if fg else "<empty>",
+                )
+                continue
+            try:
+                token_count = torch.concat(
+                    [torch.load(path, map_location="cpu") for path in chunks]
+                ).shape[0]
+            except Exception as error:
+                logger.warning(
+                    "Skipping request %s during discovery: cannot load layer-0 dumps: %s",
+                    fg[0] if fg else "<empty>",
+                    error,
+                )
+                continue
             bucket = TensorFileManager.Sequence.bucket(token_count)
             match bucket:
                 case TensorFileManager.Sequence.IGNORE:
@@ -474,19 +571,35 @@ def SVD(
             if tensor is None or token_count is None:
                 continue
 
-            assert token_count >= 1000
+            if token_count < TensorFileManager.Sequence.SHORT:
+                logger.warning(
+                    "Skipping %s: only %s tokens after reconstruction",
+                    paths[0],
+                    token_count,
+                )
+                continue
 
-            sampling_budget = tensor_manager.get_token_budget(
-                kv, kv_cache_paths, N, tensor
-            )
-            assert sampling_budget < token_count - 2 * 128
+            try:
+                sampling_budget = tensor_manager.get_token_budget(
+                    kv, kv_cache_paths, N, tensor
+                )
+                if sampling_budget >= token_count - 2 * 128:
+                    raise ValueError(
+                        f"sampling budget {sampling_budget} leaves no non-sink tokens "
+                        f"in {token_count}-token request"
+                    )
 
-            if undo_rope:
-                tensor = Rope.invert_rope(tensor)
-            tensor = trim_sink_tokens(tensor)
-            sampled_data.append(sample_tokens(tensor, sampling_budget))
+                if undo_rope:
+                    tensor = Rope.invert_rope(tensor)
+                tensor = trim_sink_tokens(tensor)
+                sampled_data.append(sample_tokens(tensor, sampling_budget))
+            except (AssertionError, RuntimeError, ValueError) as error:
+                logger.warning("Skipping %s: %s", paths[0], error)
 
     pprint.pp([d.shape for d in sampled_data])
+
+    if not sampled_data:
+        raise RuntimeError(f"No valid {kv} dump requests remain for SVD")
 
     input_tensor = transform_tensors(sampled_data)
 
