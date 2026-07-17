@@ -679,7 +679,7 @@ def run():
                         output_dict["values"][worker]["mu"] = mu
 
                 except RuntimeError as e:
-                    logger.error(f"RuntimeError: {e}")
+                    logger.exception('')
                     logger.error(f"Skip q={svd_dim} iter={svd_iter} prefix={kv}")
                     return
 
