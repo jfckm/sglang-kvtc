@@ -158,7 +158,7 @@ def count_tokens(datasets_list):
     for kv_cache_paths in datasets_list:
         ret[kv_cache_paths] = {"ignored": 0, "short": 0, "long": 0}
         for paths in datasets_list[kv_cache_paths]:
-            token_count = torch.concat([torch.load(p, map_locations="cpu") for p in paths]).shape[0]
+            token_count = torch.concat([torch.load(p, map_location="cpu") for p in paths]).shape[0]
             if token_count < 1000:
                 ret[kv_cache_paths]["ignored"] += 1
                 continue
@@ -185,7 +185,7 @@ def load_tensor(paths):
         all_layers_loaded = True
         for l in layers:
             try:
-                layer_tensors.append(torch.load(l, map_locations="cpu"))
+                layer_tensors.append(torch.load(l, map_location="cpu"))
             except:
                 logger.warning(f"Skipping {l} -- file corrupted")
                 all_layers_loaded = False
@@ -193,13 +193,24 @@ def load_tensor(paths):
         if not all_layers_loaded:
             continue
 
-        chunk = torch.stack(layer_tensors)
+        try:
+            chunk = torch.stack(layer_tensors)
+        except RuntimeError as e:
+            logger.error(str(e))
+            logger.error(f"Chunk {chunk_id} from {paths[0]} corrupted, discarding")
+            continue
         # Now chunk is 4d tensor [layer, token, head, h_dim]
 
         if ret == None:
             ret = chunk
         else:
-            ret = torch.concat([ret, chunk], dim=1)
+            try:
+                ret = torch.concat([ret, chunk], dim=1)
+            except RuntimeError as e:
+                logger.error(str(e))
+                logger.error(f"Request from {paths[0]} corrupted, discarding all")
+                return None, None
+                
 
     # Make the output tensor token first
     ret = ret.transpose(0, 1)
@@ -316,7 +327,7 @@ class TensorFileManager(object):
         logger.info(f"Looking for {kv} tensors at {tensor_dir / tp_pp_worker}")
         for fg in file_groups:
             chunks = [f for f in fg if "layer_0" in str(f)]
-            token_count = torch.concat([torch.load(p, map_locations="cpu") for p in chunks]).shape[0]
+            token_count = torch.concat([torch.load(p, map_location="cpu") for p in chunks]).shape[0]
             bucket = TensorFileManager.Sequence.bucket(token_count)
             match bucket:
                 case TensorFileManager.Sequence.IGNORE:
@@ -458,6 +469,9 @@ def SVD(
     for kv_cache_paths in tensor_manager.datasets_list:
         for paths in tensor_manager.datasets[kv_cache_paths][kv]:
             tensor, token_count = load_tensor(paths)
+            if tensor is None or token_count is None:
+                continue
+
             assert token_count >= 1000
 
             sampling_budget = tensor_manager.get_token_budget(
