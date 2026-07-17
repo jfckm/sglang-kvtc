@@ -243,6 +243,8 @@ def sample_tokens(tensor, sampling_budget):
 
 
 def transform_tensors(tensors):
+    tensors = [t for t in tensors if t.shape == tensors[0].shape]
+
     ret = torch.concat(tensors)
     token_count = ret.shape[0]
     ret = ret.view(token_count, -1)
