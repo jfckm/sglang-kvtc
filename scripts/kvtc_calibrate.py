@@ -158,7 +158,7 @@ def count_tokens(datasets_list):
     for kv_cache_paths in datasets_list:
         ret[kv_cache_paths] = {"ignored": 0, "short": 0, "long": 0}
         for paths in datasets_list[kv_cache_paths]:
-            token_count = torch.concat([torch.load(p).cpu() for p in paths]).shape[0]
+            token_count = torch.concat([torch.load(p, map_locations="cpu") for p in paths]).shape[0]
             if token_count < 1000:
                 ret[kv_cache_paths]["ignored"] += 1
                 continue
@@ -181,7 +181,19 @@ def load_tensor(paths):
         layers = [p for p in paths if f"chunk_{chunk_id}" in str(p)]
         layers.sort(key=tensor_sorting_fn)
 
-        chunk = torch.stack([torch.load(l).cpu() for l in layers])
+        layer_tensors = []
+        all_layers_loaded = True
+        for l in layers:
+            try:
+                layer_tensors.append(torch.load(l, map_locations="cpu"))
+            except:
+                logger.warning(f"Skipping {l} -- file corrupted")
+                all_layers_loaded = False
+
+        if not all_layers_loaded:
+            continue
+
+        chunk = torch.stack(layer_tensors)
         # Now chunk is 4d tensor [layer, token, head, h_dim]
 
         if ret == None:
@@ -304,7 +316,7 @@ class TensorFileManager(object):
         logger.info(f"Looking for {kv} tensors at {tensor_dir / tp_pp_worker}")
         for fg in file_groups:
             chunks = [f for f in fg if "layer_0" in str(f)]
-            token_count = torch.concat([torch.load(p).cpu() for p in chunks]).shape[0]
+            token_count = torch.concat([torch.load(p, map_locations="cpu") for p in chunks]).shape[0]
             bucket = TensorFileManager.Sequence.bucket(token_count)
             match bucket:
                 case TensorFileManager.Sequence.IGNORE:
