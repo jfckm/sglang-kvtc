@@ -8,13 +8,20 @@ import re
 import torch
 import pprint
 import logging
+import sys
 
 from pathlib import Path
 from datetime import datetime
 
-from python.sglang.srt.mem_cache.allocator import token
-from python.sglang.srt.layers.rotary_embedding.factory import get_rope
-from python.sglang.srt.utils.hf_transformers.common import get_rope_config
+sys.path.append("../python")
+from sglang.srt.mem_cache.allocator import token
+from sglang.srt.layers.rotary_embedding.factory import get_rope
+from sglang.srt.utils.hf_transformers.common import get_rope_config
+from sglang.srt.server_args import (
+       ServerArgs,
+       get_global_server_args,
+       set_global_server_args_for_scheduler
+    )
 from transformers import AutoConfig
 from collections import defaultdict
 from enum import Enum, IntEnum
@@ -27,6 +34,13 @@ class Rope(object):
     rotary_emb = None
     rotary_dim = None
     is_neox_style = None
+
+    @classmethod
+    def ensure_server_args(cls):
+        try:
+            get_global_server_args()
+        except ValueError:
+            set_global_server_args_for_scheduler(ServerArgs(model_path="DUMMY"))
 
     @classmethod
     def load_model_config(cls, model_path):
@@ -45,6 +59,7 @@ class Rope(object):
         if head_dim is None:
             head_dim = cfg.hidden_size // cfg.num_attention_heads
 
+        cls.ensure_server_args()
         cls.rotary_emb = get_rope(
             head_size=int(head_dim),
             rotary_dim=int(head_dim),
@@ -553,6 +568,7 @@ def run():
         "-N",
         "--sample-tokens",
         action="append",
+        required=True,
         help="The total number of tokens to sample from the calibration dataset (default=200,000)",
     )
     parser.add_argument(
