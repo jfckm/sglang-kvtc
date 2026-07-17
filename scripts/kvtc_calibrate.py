@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse
 import random
 import os
@@ -8,7 +10,6 @@ import pprint
 import logging
 
 from pathlib import Path
-from itertools import product
 from datetime import datetime
 
 from python.sglang.srt.mem_cache.allocator import token
@@ -19,6 +20,7 @@ from collections import defaultdict
 from enum import Enum, IntEnum
 
 logger = logging.getLogger()
+WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 
 
 class Rope(object):
@@ -271,27 +273,20 @@ class TensorFileManager(object):
         tensor_files = [x for x in (tensor_dir / tp_pp_worker).iterdir() if x.is_file()]
         tensor_files = [x for x in tensor_files if kv in x.name]
 
-        file_groups = list(set([str(x).split("-")[0] for x in tensor_files]))
-        file_groups = [
-            sorted([f for f in tensor_files if g in str(f)], key=tensor_sorting_fn)
-            for g in file_groups
-        ]
         sequences = defaultdict(list)
         for tf in tensor_files:
-            seq_prefix = str(tf).split("-")[0]
+            seq_prefix = tf.name.split(kv.value, 1)[0]
             sequences[seq_prefix].append(tf)
-        # sequences = list(set([str(x).split("-")[0] for x in tensor_files]))
 
         for seq in sequences:
             sequences[seq].sort(key=tensor_sorting_fn)
 
-        # file_groups = [sorted([f for f in tensor_files if g in str(f)], key=tensor_sorting_fn) for g in unique_sequences]
-        # Rename file groups to sequences?
+        file_groups = list(sequences.values())
 
         ret = []
         counter = {b: 0 for b in TensorFileManager.Sequence}
         buckets = {b: 0 for b in TensorFileManager.Sequence}
-        logger.info(f"Looking for {kv} tensors at {tensor_dir / tensor_dir}")
+        logger.info(f"Looking for {kv} tensors at {tensor_dir / tp_pp_worker}")
         for fg in file_groups:
             chunks = [f for f in fg if "layer_0" in str(f)]
             token_count = torch.concat([torch.load(p).cpu() for p in chunks]).shape[0]
@@ -335,15 +330,26 @@ class TensorFileManager(object):
 
         if self.sampling_policy == TensorFileManager.SamplingPolicy.STRICT:
             assert token_cnt >= 1000
-            # Equal amount of tokens will be sampled from each dataset
-            # From each dataset equal amount of tokens will be sampled from long and short sequences
+            # Divide the total sample count across every nonempty dataset/bucket.
             bucket = TensorFileManager.Sequence.bucket(token_cnt)
 
             assert bucket != TensorFileManager.Sequence.IGNORE, (
                 f"Invalid sequence length {token_cnt}"
             )
 
-            token_budget = math.ceil(N / self.context_groups[dataset_name][kv][bucket])
+            nonempty_groups = sum(
+                self.context_groups[dataset][kv][bucket] > 0
+                for dataset in self.datasets_list
+                for bucket in (
+                    TensorFileManager.Sequence.SHORT,
+                    TensorFileManager.Sequence.LONG,
+                )
+            )
+            token_budget = math.ceil(
+                N
+                / nonempty_groups
+                / self.context_groups[dataset_name][kv][bucket]
+            )
 
             if token_budget > token_cnt - sink_tokens:
                 raise ValueError(
@@ -381,10 +387,10 @@ class TensorFileManager(object):
             sequences_cnt = 0
 
             for dataset in self.context_groups:
-                sequences_cnt += self.context_groups[dataset_name][kv][
+                sequences_cnt += self.context_groups[dataset][kv][
                     TensorFileManager.Sequence.SHORT
                 ]
-                sequences_cnt += self.context_groups[dataset_name][kv][
+                sequences_cnt += self.context_groups[dataset][kv][
                     TensorFileManager.Sequence.LONG
                 ]
 
@@ -483,12 +489,54 @@ def init_logger(log_dir, filename, log_level):
     logger.info(f"Logging to {log_file_path}")
 
 
-def validate_input_data(directories: list[Path], workers: list[str]):
-    for d in directories:
-        dir_contents = set([entry.name for entry in d.iterdir() if entry.is_dir()])
-        for w in workers:
-            if w not in dir_contents:
-                raise ValueError(f"Missing {w} worker in {d}")
+def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
+    if not input_dir.is_dir():
+        raise ValueError(f"Input directory does not exist: {input_dir}")
+
+    logger.info("Scanning %s for calibration dump directories", input_dir)
+    dump_dirs = []
+    worker_sets = {}
+    for candidate in sorted(input_dir.iterdir()):
+        if not candidate.is_dir():
+            continue
+
+        workers = sorted(
+            (
+                entry.name
+                for entry in candidate.iterdir()
+                if entry.is_dir() and WORKER_DIR_PATTERN.fullmatch(entry.name)
+            ),
+            key=lambda worker: tuple(map(int, WORKER_DIR_PATTERN.fullmatch(worker).groups())),
+        )
+        if not workers:
+            logger.debug("Skipping %s: no tp_<X>_pp_<Y> worker directories", candidate)
+            continue
+
+        dump_dirs.append(candidate)
+        worker_sets[candidate] = workers
+        logger.info("Discovered dump directory %s with workers: %s", candidate, workers)
+
+    if not dump_dirs:
+        raise ValueError(
+            f"No dump directories with tp_<X>_pp_<Y> workers found in {input_dir}"
+        )
+
+    workers = worker_sets[dump_dirs[0]]
+    for dump_dir in dump_dirs[1:]:
+        if worker_sets[dump_dir] != workers:
+            raise ValueError(
+                "Dump directories must have the same worker set. "
+                f"Expected {workers} from {dump_dirs[0]}, but found "
+                f"{worker_sets[dump_dir]} in {dump_dir}."
+            )
+
+    logger.info(
+        "Using %d dump directories and %d workers: %s",
+        len(dump_dirs),
+        len(workers),
+        workers,
+    )
+    return dump_dirs, workers
 
 
 def run():
@@ -497,9 +545,7 @@ def run():
             f"\n{os.path.basename(__file__)}"
             " -N <token_sample_count> --niter <the number of subspace iterations for svd_lowrank>"
             " -q <a slightly overestimated rank of svd matrix>"
-            " -tp <tp_workers> -pp <pp_workers>"
-            " -i <dataset 1 path>"
-            " -i <dataset 2 path>"
+            " -i <dump-parent-directory>"
             " -o <output_path> -m <model_path>\n"
         )
     )
@@ -523,10 +569,8 @@ def run():
     parser.add_argument(
         "-i",
         "--input-dir",
-        action="append",
         required=True,
-        help="Path to calibration dataset. If using multiple datasets, it can be passed multiple times. The script samples equal number of tokens from every data set."
-        " (e.g. if -N 200000 and there are two datasets, 100000 tokens will be sampled from every dataset)",
+        help="Parent directory containing calibration dump directories. Tokens are sampled across all discovered dump directories.",
     )
     parser.add_argument(
         "-o",
@@ -536,18 +580,6 @@ def run():
     )
     parser.add_argument(
         "-m", "--model-dir", required=True, help="Path to the target model directory"
-    )
-    parser.add_argument(
-        "-tp",
-        "--tensor-parallelism-workers",
-        required=True,
-        help="Number of tensor parallelism workers used for generating the calibration dataset",
-    )
-    parser.add_argument(
-        "-pp",
-        "--pipeline-parallelism-workers",
-        required=True,
-        help="Number of pipeline parallelism workers used for generating the calibration dataset",
     )
     parser.add_argument("-log", "--log-level", required=False, default="info")
     parser.add_argument(
@@ -559,14 +591,12 @@ def run():
 
     args = parser.parse_args()
 
-    input_dir_list = [Path(d) for d in args.input_dir]
+    input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     N_list = [int(n) for n in args.sample_tokens]
     N_list.sort()
     svd_iter = int(args.niter)
     svd_dim = int(args.svd_dim)
-    tp_workers = int(args.tensor_parallelism_workers)
-    pp_workers = int(args.pipeline_parallelism_workers)
     log_level = args.log_level
     sampling_policy = TensorFileManager.SamplingPolicy[args.sampling_policy.upper()]
 
@@ -578,11 +608,7 @@ def run():
         log_level,
     )
 
-    workers = [
-        f"tp_{tp}_pp_{pp}" for tp, pp in product(range(tp_workers), range(pp_workers))
-    ]
-
-    validate_input_data(input_dir_list, workers)
+    input_dir_list, workers = discover_dump_directories(input_dir)
 
     output_dict = {
         "keys": {worker: {"mu": None, "basis": None} for worker in workers},
