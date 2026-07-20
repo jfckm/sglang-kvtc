@@ -706,6 +706,11 @@ def run():
         )
     )
     parser.add_argument(
+        "--kvtc-version",
+        action="version",
+        version="v1-noquant"
+    )
+    parser.add_argument(
         "-N",
         "--sample-tokens",
         action="append",
