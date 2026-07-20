@@ -1,0 +1,13 @@
+model_name: "/root/.models/Qwen3-30B-A3B"
+tasks:
+- name: "gsm8k"
+  metrics:
+  - name: "exact_match,strict-match"
+    value: 0.95
+  - name: "exact_match,flexible-extract"
+    value: 0.95
+num_concurrent: 16
+limit: 4096
+num_concurrent: 16
+max_retries: 3
+tokenized_requests: False

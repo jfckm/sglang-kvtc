@@ -10,12 +10,14 @@ from pathlib import Path
 
 import pandas as pd
 from openai import AsyncOpenAI
+
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestAscendAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     TestAscendPerformanceTestCaseBase,
 )
+from sglang.test.kits.lm_eval_kit import LMEvalMixin
 
 logger = logging.getLogger("kvtc_utils")
 
@@ -431,5 +433,15 @@ class TestAscendPerformanceKvtcTestCaseBase(
 
 class TestAscendAccuracyKvtcTestCaseBase(
     _AscendKvtcTestCaseBase, TestAscendAccuracyTestCaseBase
+):
+    pass
+
+class TestAscendPerformanceKvtcTestCaseLME(
+    _AscendKvtcTestCaseBase, LMEvalMixin
+):
+    pass
+
+class TestAscendAccuracyKvtcTestCaseLME(
+    _AscendKvtcTestCaseBase, LMEvalMixin
 ):
     pass
