@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from urllib.parse import urlparse
+import sglang
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
@@ -155,7 +156,7 @@ def run_evalscope(
     logger.info(f"Generated evalscope script: {script_path}")
 
     install_cmd = (
-        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+        f"/bin/bash {os.path.dirname(sglang.__file__)}/test/ascend/e2e/run_evalscope.sh"
     )
     subprocess.run(install_cmd, shell=True, check=True)
 
