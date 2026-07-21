@@ -98,10 +98,10 @@ async def run_requests(dataset_name, client, requests, client_concurrency):
     concurrency_semaphore = asyncio.Semaphore(client_concurrency)
 
     async def send_request(dataset_name, client, entry):
-        prompt_id, prompt = entry
+        prompt = entry
 
         async with concurrency_semaphore:
-            logger.debug(f"KVTC calibration {dataset_name} request {prompt_id}")
+            logger.debug(f"KVTC calibration {dataset_name} request")
             response = await client.chat.completions.create(
                 model="Qwen3-30B-A3B",
                 messages=[{"role": "user", "content": prompt}],
