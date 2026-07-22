@@ -94,6 +94,24 @@ class KVTCHostMemoryRequest:
     layer_id: int | None
 
 
+@dataclass(frozen=True)
+class _KVTCQuantGroup:
+    feature_start: int
+    feature_end: int
+    dtype_name: str
+    payload_start: int
+    payload_end: int
+    metadata_index: Optional[int]
+
+
+@dataclass(frozen=True)
+class _KVTCQuantLayout:
+    groups: tuple[_KVTCQuantGroup, ...]
+    feature_count: int
+    payload_elements: dict[str, int]
+    metadata_count: int
+
+
 class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
@@ -3280,6 +3298,20 @@ class DSAIndexerPoolHost(HostKVCache):
         return ptr_list, [page_stride_bytes] * len(ptr_list)
 
 class NPUMHATokenToKVPoolCompressed(HostKVCache):
+    _QUANT_STORAGE_DTYPES = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "int4": torch.int32,
+        "int8": torch.int8,
+    }
+    _QUANT_PRECISION_BITS = {
+        "float32": 32,
+        "bfloat16": 16,
+        "int8": 8,
+        "int4": 4,
+    }
+    _QUANT_METADATA_DTYPE = torch.float16
+
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
@@ -3300,7 +3332,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.page_size = page_size
         self.device = "cpu"
         self.dtype = device_pool.store_dtype
-        self.compressed_dtype = torch.float32
         self.rotary_emb = rotary_emb
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
@@ -3319,6 +3350,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
         self.k_kvtc = False
         self.v_kvtc = False
+        self.k_quant_layout = None
+        self.v_quant_layout = None
 
         p = self.layer_num * self.head_num * self.head_dim
 
@@ -3343,7 +3376,13 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 if keys_params is None:
                     raise Exception(f"Wrong K KVTC config - missing {worker_key}")
 
-                k_dim_limit = p // int(kvtc_k_compression_ratio)
+                self.k_quant_layout = self._load_quant_layout(
+                    kvtc_params["keys"],
+                    kvtc_k_compression_ratio,
+                    keys_params["basis"].shape[1],
+                    "K",
+                )
+                k_dim_limit = self.k_quant_layout.feature_count
 
                 self.kvtc_k_mu = self._copy_with_trim(keys_params["mu"])
 
@@ -3371,7 +3410,13 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 if values_params is None:
                     raise Exception(f"Wrong V KVTC config - missing {worker_key}")
 
-                v_dim_limit = p // int(kvtc_v_compression_ratio)
+                self.v_quant_layout = self._load_quant_layout(
+                    kvtc_params["values"],
+                    kvtc_v_compression_ratio,
+                    values_params["basis"].shape[1],
+                    "V",
+                )
+                v_dim_limit = self.v_quant_layout.feature_count
 
                 self.kvtc_v_mu = self._copy_with_trim(values_params["mu"])
 
@@ -3393,15 +3438,14 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
             torch_npu.npu.synchronize()
 
-
-        self.size_per_token = self.get_size_per_token()
+        self.page_size_bytes = self._get_page_size_bytes()
+        self.size_per_token = self.page_size_bytes / self.page_size
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.page_num = int(host_size * 1e9 // self.page_size_bytes) + 1
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
+            self.page_num = self.size // self.page_size + 1
 
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         if skip_size_check == False:
             assert (
@@ -3414,11 +3458,175 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def _load_quant_layout(
+        self,
+        matrix_params: dict,
+        compression_ratio: float,
+        basis_rank: int,
+        matrix_name: str,
+    ) -> _KVTCQuantLayout:
+        ratio = float(compression_ratio)
+        if ratio <= 0 or not ratio.is_integer():
+            raise ValueError(
+                f"{matrix_name} KVTC compression ratio must be a positive integer, got {compression_ratio}"
+            )
+
+        quant_configs = matrix_params.get("quant")
+        ratio_key = str(int(ratio))
+        if not isinstance(quant_configs, dict) or ratio_key not in quant_configs:
+            raise ValueError(
+                f"{matrix_name} KVTC config is missing quantization schema quant[{ratio_key!r}]"
+            )
+
+        schema = quant_configs[ratio_key]
+        if not isinstance(schema, (list, tuple)) or not schema:
+            raise ValueError(
+                f"{matrix_name} KVTC quantization schema {ratio_key!r} must be a non-empty list"
+            )
+
+        groups = []
+        feature_offset = 0
+        metadata_count = 0
+        previous_precision = None
+        payload_offsets = {dtype_name: 0 for dtype_name in self._QUANT_STORAGE_DTYPES}
+        for group_index, entry in enumerate(schema):
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ValueError(
+                    f"{matrix_name} KVTC quantization entry {group_index} must be (group_size, dtype)"
+                )
+
+            group_size, dtype_name = entry
+            if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size <= 0:
+                raise ValueError(
+                    f"{matrix_name} KVTC quantization group {group_index} has invalid size {group_size!r}"
+                )
+            if dtype_name not in self._QUANT_STORAGE_DTYPES:
+                raise ValueError(
+                    f"{matrix_name} KVTC quantization group {group_index} has unsupported dtype {dtype_name!r}"
+                )
+            precision = self._QUANT_PRECISION_BITS[dtype_name]
+            if previous_precision is not None and precision > previous_precision:
+                raise ValueError(
+                    f"{matrix_name} KVTC quantization schema must use non-increasing precision; group {group_index} changes from {previous_precision} to {precision} bits"
+                )
+            previous_precision = precision
+
+            if dtype_name == "int4":
+                if group_size % 8 != 0:
+                    raise ValueError(
+                        f"{matrix_name} KVTC int4 group {group_index} has size {group_size}; packed int4 requires group size to be a multiple of 8"
+                    )
+                unpacked_elements = self.page_size * group_size
+                payload_elements = unpacked_elements // 8
+            else:
+                payload_elements = self.page_size * group_size
+
+            metadata_index = None
+            if dtype_name in ("int4", "int8"):
+                metadata_index = metadata_count
+                metadata_count += 1
+
+            payload_start = payload_offsets[dtype_name]
+            payload_end = payload_start + payload_elements
+            groups.append(
+                _KVTCQuantGroup(
+                    feature_start=feature_offset,
+                    feature_end=feature_offset + group_size,
+                    dtype_name=dtype_name,
+                    payload_start=payload_start,
+                    payload_end=payload_end,
+                    metadata_index=metadata_index,
+                )
+            )
+            feature_offset += group_size
+            payload_offsets[dtype_name] = payload_end
+
+        if feature_offset > basis_rank:
+            raise ValueError(
+                f"{matrix_name} KVTC quantization schema retains {feature_offset} features, but basis rank is only {basis_rank}"
+            )
+
+        missing_ops = (
+            [
+                op
+                for op in ("npu_dynamic_quant_asymmetric", "npu_anti_quant")
+                if not hasattr(torch_npu, op)
+            ]
+            if metadata_count > 0
+            else []
+        )
+        if missing_ops:
+            raise RuntimeError(
+                f"{matrix_name} KVTC quantization requires missing torch-npu APIs: {', '.join(missing_ops)}"
+            )
+        if metadata_count > 0 and self.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"{matrix_name} KVTC quantization requires an FP16 or BF16 device KV cache, got {self.dtype}"
+            )
+
+        return _KVTCQuantLayout(
+            groups=tuple(groups),
+            feature_count=feature_offset,
+            payload_elements={
+                dtype_name: count for dtype_name, count in payload_offsets.items() if count > 0
+            },
+            metadata_count=metadata_count,
+        )
+
+    def _get_matrix_page_size_bytes(
+        self, enabled: bool, layout: Optional[_KVTCQuantLayout]
+    ) -> int:
+        if not enabled:
+            return (
+                self.layer_num
+                * self.page_size
+                * self.head_num
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+
+        payload_bytes = sum(
+            element_count * self._QUANT_STORAGE_DTYPES[dtype_name].itemsize
+            for dtype_name, element_count in layout.payload_elements.items()
+        )
+        metadata_bytes = (
+            self.page_size
+            * layout.metadata_count
+            * 2
+            * self._QUANT_METADATA_DTYPE.itemsize
+        )
+        return payload_bytes + metadata_bytes
+
+    def _get_page_size_bytes(self) -> int:
+        return self._get_matrix_page_size_bytes(
+            self.k_kvtc, self.k_quant_layout
+        ) + self._get_matrix_page_size_bytes(self.v_kvtc, self.v_quant_layout)
+
     def _copy_with_trim(self, in_tensor: torch.Tensor, out_shape=None) -> torch.Tensor:
         out_shape = out_shape or in_tensor.shape
         out_slices = tuple(slice(0, x) for x in out_shape)
 
         return in_tensor[out_slices].to(self.device_pool.device)
+
+    def _allocate_quant_buffers(self, layout: _KVTCQuantLayout):
+        payload_buffers = {
+            dtype_name: torch.zeros(
+                (self.page_num, element_count),
+                dtype=self._QUANT_STORAGE_DTYPES[dtype_name],
+                device=self.device,
+                pin_memory=True,
+            )
+            for dtype_name, element_count in layout.payload_elements.items()
+        }
+        metadata_shape = (self.page_num, self.page_size, layout.metadata_count)
+        scales = torch.zeros(
+            metadata_shape,
+            dtype=self._QUANT_METADATA_DTYPE,
+            device=self.device,
+            pin_memory=True,
+        )
+        offsets = torch.zeros_like(scales)
+        return payload_buffers, scales, offsets
 
     def init_kv_buffer(self):
         logger.info(f"NPU compressed pool alloc begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
@@ -3427,15 +3635,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         # Continuous memory improves the efficiency of Ascend`s transmission backend,
         # while other backends remain unchanged.
         if self.k_kvtc:
-            self.k_buffer = torch.zeros(
-                (
-                    self.page_num,
-                    *self.offload_page_shape_k
-                ),
-                dtype=self.compressed_dtype,
-                device=self.device,
-                pin_memory=True,
-            )
+            (
+                self.k_quant_buffers,
+                self.k_quant_scales,
+                self.k_quant_offsets,
+            ) = self._allocate_quant_buffers(self.k_quant_layout)
+            self.k_buffer = self.k_quant_buffers
         else:
             self.k_buffer = torch.zeros(
                 (
@@ -3451,15 +3656,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             )
 
         if self.v_kvtc:
-            self.v_buffer = torch.zeros(
-                (
-                    self.page_num,
-                    *self.offload_page_shape_v
-                ),
-                dtype=self.compressed_dtype,
-                device=self.device,
-                pin_memory=True,
-            )
+            (
+                self.v_quant_buffers,
+                self.v_quant_scales,
+                self.v_quant_offsets,
+            ) = self._allocate_quant_buffers(self.v_quant_layout)
+            self.v_buffer = self.v_quant_buffers
         else:
             self.v_buffer = torch.zeros(
                 (
@@ -3477,21 +3679,119 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         logger.info(f"NPU compressed pool alloc end(pages={self.page_num}. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
 
     def get_size_per_token(self):
-        size = 0
-        if self.k_kvtc:
-            size += self.offload_page_shape_k[1] * self.compressed_dtype.itemsize
-        else:
-            size += self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
-
-        if self.v_kvtc:
-            size += self.offload_page_shape_v[1] * self.compressed_dtype.itemsize
-        else:
-            size += self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
-
-        return size
+        return self._get_page_size_bytes() / self.page_size
 
     def get_ksize_per_token(self):
-        return self.get_size_per_token() // 2
+        return (
+            self._get_matrix_page_size_bytes(self.k_kvtc, self.k_quant_layout)
+            / self.page_size
+        )
+
+    def _quantize_page(
+        self,
+        X: torch.Tensor,
+        host_page: int,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        quantized_by_dtype = defaultdict(list)
+        group_scales = []
+        group_offsets = []
+        for group in layout.groups:
+            group_values = X[:, group.feature_start : group.feature_end]
+            if group.dtype_name in ("float32", "bfloat16"):
+                quantized_by_dtype[group.dtype_name].append(
+                    group_values.reshape(-1).to(
+                        dtype=self._QUANT_STORAGE_DTYPES[group.dtype_name]
+                    )
+                )
+                continue
+
+            group_values = group_values.to(dtype=self.dtype)
+            dst_type = (
+                torch.quint4x2 if group.dtype_name == "int4" else torch.int8
+            )
+            quantized, scale, quant_offset = torch_npu.npu_dynamic_quant_asymmetric(
+                group_values, dst_type=dst_type
+            )
+            quantized_by_dtype[group.dtype_name].append(quantized.reshape(-1))
+            group_scales.append(scale.reshape(self.page_size))
+            # npu_anti_quant computes (q + offset) * scale, while the dynamic
+            # quantizer returns q = round(x / scale + offset).
+            group_offsets.append((-quant_offset).reshape(self.page_size))
+
+        for dtype_name, chunks in quantized_by_dtype.items():
+            payload_buffers[dtype_name][host_page].copy_(
+                torch.cat(chunks).to(device=self.device)
+            )
+        if group_scales:
+            scales[host_page].copy_(
+                torch.stack(group_scales, dim=1).to(
+                    device=self.device, dtype=self._QUANT_METADATA_DTYPE
+                )
+            )
+            offsets[host_page].copy_(
+                torch.stack(group_offsets, dim=1).to(
+                    device=self.device, dtype=self._QUANT_METADATA_DTYPE
+                )
+            )
+
+    def _dequantize_page(
+        self,
+        host_page: int,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        device = self.device_pool.device
+        device_payloads = {
+            dtype_name: payload[host_page].to(device=device)
+            for dtype_name, payload in payload_buffers.items()
+        }
+        device_scales = scales[host_page].to(device=device, dtype=torch.float32)
+        device_offsets = offsets[host_page].to(device=device, dtype=torch.float32)
+        X = torch.empty(
+            (self.page_size, layout.feature_count),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        for group in layout.groups:
+            payload = device_payloads[group.dtype_name][
+                group.payload_start : group.payload_end
+            ].reshape(1, -1)
+            if group.dtype_name in ("float32", "bfloat16"):
+                X[:, group.feature_start : group.feature_end] = payload.reshape(
+                    self.page_size, group.feature_end - group.feature_start
+                )
+                continue
+
+            group_size = group.feature_end - group.feature_start
+            expanded_scales = device_scales[:, group.metadata_index].repeat_interleave(
+                group_size
+            )
+            expanded_offsets = device_offsets[:, group.metadata_index].repeat_interleave(
+                group_size
+            )
+            kwargs = {
+                "offset": expanded_offsets,
+                "dst_dtype": self.dtype,
+            }
+            if group.dtype_name == "int4" and hasattr(torch, "int4"):
+                kwargs["src_dtype"] = torch.quint4x2
+            dequantized = torch_npu.npu_anti_quant(
+                payload,
+                expanded_scales,
+                **kwargs,
+            )
+            X[:, group.feature_start : group.feature_end] = dequantized.reshape(
+                self.page_size, group.feature_end - group.feature_start
+            )
+
+        return X
 
     def load_to_device_per_layer(
         self,
@@ -3516,10 +3816,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
 
             if self.k_kvtc:
+                D_k = self._dequantize_page(
+                    host_page,
+                    self.k_quant_layout,
+                    self.k_quant_buffers,
+                    self.k_quant_scales,
+                    self.k_quant_offsets,
+                )
                 X_k = (
-                    torch.matmul(
-                        self.k_buffer[host_page].to(device=self.device_pool.device), self.kvtc_k_V.T
-                    )
+                    torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
                     + self.kvtc_k_mu
                 )
                 device_pool.k_buffer[:, device_page, ...] = (
@@ -3538,10 +3843,17 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
 
             if self.v_kvtc:
+                D_v = self._dequantize_page(
+                    host_page,
+                    self.v_quant_layout,
+                    self.v_quant_buffers,
+                    self.v_quant_scales,
+                    self.v_quant_offsets,
+                )
                 X_v = (
                     (
                         torch.matmul(
-                            self.v_buffer[host_page].to(device=self.device_pool.device),
+                            D_v.to(dtype=self.kvtc_v_V.dtype),
                             self.kvtc_v_V.T,
                         )
                         + self.kvtc_v_mu
@@ -3573,9 +3885,17 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             if self.k_kvtc:
                 X_k = device_pool.k_buffer[:, device_page, ...].transpose(1, 0)
                 X_k_unrotated = self.rotary_emb.invert_native_keys_batch(page_token_indices, X_k)
-                self.k_buffer[host_page] = torch.matmul(
+                D_k = torch.matmul(
                     (X_k_unrotated.reshape(self.page_size, -1) - self.kvtc_k_mu), self.kvtc_k_V
-                ).to(device=self.device)
+                )
+                self._quantize_page(
+                    D_k,
+                    host_page,
+                    self.k_quant_layout,
+                    self.k_quant_buffers,
+                    self.k_quant_scales,
+                    self.k_quant_offsets,
+                )
             else:
                 self.k_buffer[:, host_page, ...] = device_pool.k_buffer[:, device_page, ...].to(
                     device=self.device
@@ -3587,8 +3907,14 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     .transpose(1, 0)
                     .reshape(self.page_size, -1)
                 )
-                self.v_buffer[host_page] = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V).to(
-                    device=self.device
+                D_v = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V)
+                self._quantize_page(
+                    D_v,
+                    host_page,
+                    self.v_quant_layout,
+                    self.v_quant_buffers,
+                    self.v_quant_scales,
+                    self.v_quant_offsets,
                 )
             else:
                 self.v_buffer[:, host_page, ...] = device_pool.v_buffer[:, device_page, ...].to(
