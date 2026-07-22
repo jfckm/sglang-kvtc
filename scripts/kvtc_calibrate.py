@@ -28,6 +28,7 @@ from enum import Enum, IntEnum
 
 logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
+KVTC_FILE_VERSION="v1-noquant"
 
 
 class Rope(object):
@@ -706,9 +707,14 @@ def run():
         )
     )
     parser.add_argument(
+        "--kvtc-version",
+        action="version",
+        version=KVTC_FILE_VERSION
+    )
+    parser.add_argument(
         "-N",
         "--sample-tokens",
-        action="append",
+        type=int,
         required=True,
         help="The total number of tokens to sample from the calibration dataset (default=200,000)",
     )
@@ -731,9 +737,14 @@ def run():
     )
     parser.add_argument(
         "-o",
-        "--output-dir",
+        "--output",
         required=True,
-        help="Directory to save the compression matrix and the logs",
+        help="Calibration file output",
+    )
+    parser.add_argument(
+        "--log-dir",
+        required=True,
+        help="Calibration file output",
     )
     parser.add_argument(
         "-m", "--model-dir", required=True, help="Path to the target model directory"
@@ -749,9 +760,9 @@ def run():
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-    N_list = [int(n) for n in args.sample_tokens]
-    N_list.sort()
+    output_path = Path(args.output)
+    log_dir = Path(args.log_dir)
+    N = args.sample_tokens
     svd_iter = int(args.niter)
     svd_dim = int(args.svd_dim)
     log_level = args.log_level
@@ -760,7 +771,7 @@ def run():
     Rope.load_model_config(args.model_dir)
 
     init_logger(
-        output_dir,
+        log_dir,
         f"svd-q{svd_dim}_iter{svd_iter}_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log",
         log_level,
     )
@@ -768,38 +779,36 @@ def run():
     input_dir_list, workers = discover_dump_directories(input_dir)
 
     output_dict = {
+        "version": KVTC_FILE_VERSION,
         "keys": {worker: {"mu": None, "basis": None} for worker in workers},
         "values": {worker: {"mu": None, "basis": None} for worker in workers},
     }
 
-    for N in N_list:
-        logger.info(
-            f"-------------------- N={N} q={svd_dim} iter={svd_iter} --------------------"
-        )
+    logger.info(
+        f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
+    )
 
-        for worker in workers:
-            tensor_manager = TensorFileManager(input_dir_list, worker, sampling_policy)
-            for kv in TensorFileManager.KV:
-                undo_rope = kv == TensorFileManager.KV.K
-                try:
-                    mu, U, S, V = SVD(
-                        tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
-                    )
-                    logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
-                    if kv == TensorFileManager.KV.K:
-                        output_dict["keys"][worker]["basis"] = V
-                        output_dict["keys"][worker]["mu"] = mu
-                    elif kv == TensorFileManager.KV.V:
-                        output_dict["values"][worker]["basis"] = V
-                        output_dict["values"][worker]["mu"] = mu
+    for worker in workers:
+        tensor_manager = TensorFileManager(input_dir_list, worker, sampling_policy)
+        for kv in TensorFileManager.KV:
+            undo_rope = kv == TensorFileManager.KV.K
+            try:
+                mu, U, S, V = SVD(
+                    tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
+                )
+                logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
+                if kv == TensorFileManager.KV.K:
+                    output_dict["keys"][worker]["basis"] = V
+                    output_dict["keys"][worker]["mu"] = mu
+                elif kv == TensorFileManager.KV.V:
+                    output_dict["values"][worker]["basis"] = V
+                    output_dict["values"][worker]["mu"] = mu
 
-                except RuntimeError as e:
-                    logger.exception('')
-                    logger.error(f"Skip q={svd_dim} iter={svd_iter} prefix={kv}")
-                    return
+            except RuntimeError as e:
+                logger.exception('')
+                return
 
-        output_dict_path = output_dir / f"svd_n_{N}_iter_{svd_iter}.pt"
-        torch.save(output_dict, output_dict_path)
+        torch.save(output_dict, output_path)
 
 
 if __name__ == "__main__":
