@@ -36,11 +36,15 @@ OPENMATH_PARTS = 10
 KVTC_DATASET_CONFIG = {
     "openmath": {
         "paths": KVTC_DATASETS_PATH / "openmath_selected_problems.parquet",
-        "prompt_column": "problem",
+        "prompt_columns": [
+            "problem", "solution", "answer"
+        ],
     },
     "fineweb": {
         "paths": KVTC_DATASETS_PATH / "fineweb_selected_problems.parquet",
-        "prompt_column": "text",
+        "prompt_columns": [
+            "text"
+        ],
     },
 }
 
@@ -398,16 +402,17 @@ class _AscendKvtcTestCaseBase:
 
     @classmethod
     def get_kvtc_prompts(cls, dataset_name: str):
-        prompt_column = cls.kvtc_dataset_config[dataset_name]["prompt_column"]
+        prompt_columns = cls.kvtc_dataset_config[dataset_name]["prompt_columns"]
         dataset = cls.load_kvtc_dataset(dataset_name)
 
-        if prompt_column not in dataset.columns:
+        missing = set(prompt_columns) - set(dataset.columns)
+        if len(missing):
             raise ValueError(
-                f"Dataset {dataset_name} does not contain prompt column "
-                f"{prompt_column!r}; available columns: {list(dataset.columns)}"
+                f"Dataset {dataset_name} does not contain prompt columns "
+                f"{missing!r}; available columns: {list(dataset.columns)}"
             )
 
-        prompts = dataset[prompt_column]
+        prompts = dataset[prompt_columns].astype(str).agg(" ".join, axis=1)
 
         logger.info(f"Found {len(prompts)} calibration prompts for {dataset_name}")
 
