@@ -90,7 +90,7 @@ QWEN3_5_27B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-27B-W8A8"
 )
 QWEN3_30B_A3B_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-Instruct-2507"
+    "/root/.models/Qwen3-30B-A3B"
 )
 QWEN3_6_35B_A3B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3.6-35B-A3B"
 QWEN3_6_27B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3.6-27B"
@@ -584,7 +584,7 @@ def run_aisbench(
     result_path = "./aisbench_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    cmd = f"/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_aisbench.sh "
+    cmd = f"/bin/bash /root/kamil_test_na_os/sglang/python/sglang/test/ascend/e2e/run_aisbench.sh "
     cmd += f"--mode perf "
     cmd += f"--ip {host} "
     cmd += f"--port {str(port)} "
