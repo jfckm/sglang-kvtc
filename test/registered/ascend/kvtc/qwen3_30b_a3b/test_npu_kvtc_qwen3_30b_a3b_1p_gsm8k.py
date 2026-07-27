@@ -3,7 +3,6 @@
 Tests Qwen/Qwen3-30B-A3B with lm-eval GSM8K benchmark on NPU
 """
 
-import os
 import unittest
 import numpy as np
 import yaml
@@ -135,12 +134,8 @@ class TestNPUQwen3_30BA3B_1P_gsm8k(TestAscendPerformanceKvtcTestCaseLME, CustomT
         kill_process_tree(cls.process.pid)
 
     def test_lm_eval(self):
-        eval_config = yaml.safe_load(
-            Path(self.model_config_name).read_text(encoding="utf-8")
-        )
-
         # filling kvcache run
-        self.launch_lm_eval(eval_config)
+        self.launch_lm_eval()
 
         # requests.post(url=self.base_url + "/flush_cache", timeout=30)
         # resp = requests.get(url=self.base_url+ "/radix_tree", timeout=30)

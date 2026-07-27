@@ -1,14 +1,19 @@
+import ast
 import asyncio
 import fcntl
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
-import sys
-from pathlib import Path
-
+import lm_eval
 import pandas as pd
+import requests
+import sys
+
+from contextlib import contextmanager
+from pathlib import Path
 from openai import AsyncOpenAI
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -30,31 +35,51 @@ KVTC_CALIBRATION_LOCK_PATH = KVTC_CACHE_PATH / ".calibration.lock"
 KVTC_DUMP_METADATA_FILENAME = "metadata.json"
 KVTC_CALIBRATION_METADATA_FILENAME = "calibration.metadata.json"
 KVTC_CALIBRATION_FILENAME = "kvtc.pt"
-KVTC_CALIBRATION_SCRIPT_PATH = (
-    KVTC_REPO_PATH / "scripts" /  "kvtc_calibrate.py"
-)
+KVTC_CALIBRATION_SCRIPT_PATH = KVTC_REPO_PATH / "scripts" / "kvtc_calibrate.py"
 
 OPENMATH_PARTS = 10
 KVTC_DATASET_CONFIG = {
     "openmath": {
         "paths": KVTC_DATASETS_PATH / "openmath_selected_problems.parquet",
-        "prompt_columns": [
-            "problem", "solution", "answer"
-        ],
+        "prompt_columns": ["problem", "solution", "answer"],
     },
     "fineweb": {
         "paths": KVTC_DATASETS_PATH / "fineweb_selected_problems.parquet",
-        "prompt_columns": [
-            "text"
-        ],
+        "prompt_columns": ["text"],
     },
 }
 
 KVTC_CALIBRATION_PARAMS = {
-        "N": 200000,
-        "q": 10000,
-        "niter": 2,
+    "N": 200000,
+    "q": 10000,
+    "niter": 2,
 }
+
+
+@contextmanager
+def scoped_env_vars(new_env: dict[str, str] | None):
+    """Context manager to temporarily set environment variables."""
+    if not new_env:
+        yield
+        return
+
+    old_values = {}
+    new_keys = []
+
+    try:
+        for key, value in new_env.items():
+            if key in os.environ:
+                old_values[key] = os.environ[key]
+            else:
+                new_keys.append(key)
+            os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in old_values.items():
+            os.environ[key] = value
+        for key in new_keys:
+            os.environ.pop(key, None)
+
 
 class _AscendKvtcTestCaseBase:
     kvtc_dataset_config = KVTC_DATASET_CONFIG
@@ -63,11 +88,11 @@ class _AscendKvtcTestCaseBase:
 
     kvtc_calibration_params = KVTC_CALIBRATION_PARAMS
 
-
     kvtc_keys_compression_ratio = 8
     kvtc_values_compression_ratio = 8
     kvtc_sliding_window = 128
     kvtc_hicache_size = 15
+    base_url = None
 
     @classmethod
     def _get_arg_value(cls, option: str, default: int) -> int:
@@ -102,7 +127,9 @@ class _AscendKvtcTestCaseBase:
     @classmethod
     def _set_kvtc_artifact_paths(cls) -> None:
         metadata = cls._get_kvtc_config_metadata()
-        metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
+        metadata_json = json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"), default=str
+        )
         config_id = hashlib.sha256(metadata_json.encode()).hexdigest()[:16]
         model_id = hashlib.sha256(str(cls.model).encode()).hexdigest()[:8]
         model_name = Path(str(cls.model)).name
@@ -116,7 +143,9 @@ class _AscendKvtcTestCaseBase:
         )
         cls.kvtc_dump_path = cls.kvtc_artifact_path / "dump"
         cls.kvtc_calibration_path = (
-            cls.kvtc_artifact_path / cls._get_kvtc_calibration_version() / KVTC_CALIBRATION_FILENAME
+            cls.kvtc_artifact_path
+            / cls._get_kvtc_calibration_version()
+            / KVTC_CALIBRATION_FILENAME
         )
 
     @classmethod
@@ -134,7 +163,10 @@ class _AscendKvtcTestCaseBase:
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
         temporary_path.write_text(
-            json.dumps(cls._get_kvtc_config_metadata(), indent=2, sort_keys=True, default=str) + "\n"
+            json.dumps(
+                cls._get_kvtc_config_metadata(), indent=2, sort_keys=True, default=str
+            )
+            + "\n"
         )
         temporary_path.replace(metadata_path)
 
@@ -153,9 +185,8 @@ class _AscendKvtcTestCaseBase:
     @classmethod
     def _has_current_kvtc_calibration(cls) -> bool:
         metadata_path = cls.kvtc_artifact_path / KVTC_CALIBRATION_METADATA_FILENAME
-        return (
-            cls.kvtc_calibration_path.is_file()
-            and cls._check_metadata(metadata_path)
+        return cls.kvtc_calibration_path.is_file() and cls._check_metadata(
+            metadata_path
         )
 
     @classmethod
@@ -166,9 +197,7 @@ class _AscendKvtcTestCaseBase:
         async def send_request(entry) -> bool:
             prompt = entry
             async with semaphore:
-                logger.debug(
-                    "KVTC dump %s request %s", dataset_name
-                )
+                logger.debug("KVTC dump %s request %s", dataset_name)
                 try:
                     await client.chat.completions.create(
                         model=str(cls.model),
@@ -185,7 +214,9 @@ class _AscendKvtcTestCaseBase:
                 return True
 
         try:
-            results = await asyncio.gather(*(send_request(prompt) for prompt in prompts))
+            results = await asyncio.gather(
+                *(send_request(prompt) for prompt in prompts)
+            )
         finally:
             await client.close()
 
@@ -240,9 +271,7 @@ class _AscendKvtcTestCaseBase:
                 try:
                     super().setUpClass()
                     dump_server_started = True
-                    asyncio.run(
-                        cls._send_kvtc_dump_requests(dataset_name, prompts)
-                    )
+                    asyncio.run(cls._send_kvtc_dump_requests(dataset_name, prompts))
                 finally:
                     try:
                         if dump_server_started or cls.process is not None:
@@ -333,7 +362,7 @@ class _AscendKvtcTestCaseBase:
         except BaseException as e:
             if isinstance(e, subprocess.CalledProcessError):
                 logger.error(f"KVTC calibration script failed {e.output}")
-                logger.exception('')
+                logger.exception("")
             temporary_path.unlink(missing_ok=True)
             raise
 
@@ -401,7 +430,6 @@ class _AscendKvtcTestCaseBase:
 
         return pd.read_parquet(cls.kvtc_dataset_config[dataset_name]["paths"])
 
-
     @classmethod
     def get_kvtc_prompts(cls, dataset_name: str):
         prompt_columns = cls.kvtc_dataset_config[dataset_name]["prompt_columns"]
@@ -419,10 +447,23 @@ class _AscendKvtcTestCaseBase:
         logger.info(f"Found {len(prompts)} calibration prompts for {dataset_name}")
 
         if cls.kvtc_limit_calibration:
-            logger.warning(f"Short KVTC calibration active, limiting to {cls.kvtc_limit_calibration} prompts")
-            prompts = prompts[:cls.kvtc_limit_calibration]
+            logger.warning(
+                f"Short KVTC calibration active, limiting to {cls.kvtc_limit_calibration} prompts"
+            )
+            prompts = prompts[: cls.kvtc_limit_calibration]
 
         return prompts
+
+    @classmethod
+    def _validate_trim_eviction(cls, data):
+        pass
+
+    @classmethod
+    def trim_cache(cls):
+        requests.post(url=cls.base_url + "/flush_cache", timeout=30)
+        resp = requests.get(url=cls.base_url + "/radix_tree", timeout=30)
+        data = ast.literal_eval(resp.text)
+        cls._validate_trim_eviction(data)
 
 
 class TestAscendPerformanceKvtcTestCaseBase(
@@ -436,12 +477,43 @@ class TestAscendAccuracyKvtcTestCaseBase(
 ):
     pass
 
-class TestAscendPerformanceKvtcTestCaseLME(
-    _AscendKvtcTestCaseBase, LMEvalMixin
-):
-    pass
 
-class TestAscendAccuracyKvtcTestCaseLME(
-    _AscendKvtcTestCaseBase, LMEvalMixin
+class TestAscendPerformanceKvtcTestCaseLME(
+    _AscendKvtcTestCaseBase,
 ):
-    pass
+    model = None
+    batch_size = "auto"
+    backend = "local-completions"
+    num_concurrent = 1
+    env_vars = None
+    metadata = {None}
+    num_fewshot = 0
+    limit = None
+    apply_chat_template = False
+    fewshot_as_multiturn = False
+    gen_kwargs = None
+    task_list = [{"name": None}]
+
+    model_args = {
+        "model": model,
+        "base_url": None,
+        "num_concurrent": num_concurrent,
+    }
+
+    @classmethod
+    def launch_lm_eval(cls):
+        with scoped_env_vars(cls.env_vars):
+            results = lm_eval.simple_evaluate(
+                model=cls.backend,
+                model_args=cls.model_args,
+                tasks=[task["name"] for task in cls.task_list],
+                task_manager=lm_eval.tasks.TaskManager(metadata=cls.metadata),
+                num_fewshot=cls.num_fewshot,
+                limit=cls.limit,
+                apply_chat_template=cls.apply_chat_template,
+                fewshot_as_multiturn=cls.fewshot_as_multiturn,
+                gen_kwargs=cls.gen_kwargs,
+                batch_size=cls.batch_size,
+            )
+
+            return results
