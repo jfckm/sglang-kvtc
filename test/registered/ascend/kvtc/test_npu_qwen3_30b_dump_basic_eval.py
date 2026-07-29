@@ -175,6 +175,7 @@ class TestKVTCQwen30BCalibrateLong(TestAscendPerformanceKvtcTestCaseBase):
         **KVTC_CALIBRATION_PARAMS,
         "N": 200000,
         "q": 8000,
+        "compression_ratios": [8, 16, 32]
     }
 
     def test_kvtc_qwen3_30b_dump_reuse(self):

@@ -53,6 +53,7 @@ KVTC_CALIBRATION_PARAMS = {
         "N": 200000,
         "q": 10000,
         "niter": 2,
+        "compression_ratios": [8]
 }
 
 class _AscendKvtcTestCaseBase:
@@ -314,6 +315,8 @@ class _AscendKvtcTestCaseBase:
                     str(cls.kvtc_calibration_params["N"]),
                     "--niter",
                     str(cls.kvtc_calibration_params["niter"]),
+                    "--compression-ratios",
+                    " ".join(cls.kvtc_calibration_params["compression_ratios"]),
                 ],
                 check=True,
                 capture_output=True,
