@@ -6,15 +6,18 @@ import os
 import math
 import re
 import torch
-import pprint
 import logging
 import sys
 
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
 
 sys.path.append("../python")
-from sglang.srt.mem_cache.allocator import token
+from sglang.srt.mem_cache.kvtc_quant import (
+    build_quant_layout,
+    quant_group_bits,
+)
 from sglang.srt.layers.rotary_embedding.factory import get_rope
 from sglang.srt.utils.hf_transformers.common import get_rope_config
 from sglang.srt.server_args import (
@@ -28,7 +31,11 @@ from enum import Enum, IntEnum
 
 logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
-KVTC_FILE_VERSION="v1-noquant"
+KVTC_FILE_VERSION = "v2-quant"
+QUANT_DTYPES = ("float32", "bfloat16", "int8", "int4")
+QUANT_BLOCK_SIZES = (1, 16, 64, 256, 1024)
+INT4_BLOCK_SIZES = (8, 16, 64, 256, 1024)
+SINK_TOKENS = 256
 
 
 class Rope(object):
@@ -293,9 +300,9 @@ def trim_sink_tokens(tensor):
     return tensor[128:-128]
 
 
-def sample_tokens(tensor, sampling_budget):
+def sample_tokens(tensor, sampling_budget, rng):
     token_cnt = tensor.shape[0]
-    ids = random.sample(list(range(token_cnt)), sampling_budget)
+    ids = rng.sample(range(token_cnt), sampling_budget)
     ids.sort()
 
     ids = torch.Tensor(ids).to(device="cpu").int()
@@ -356,11 +363,22 @@ class TensorFileManager(object):
             else:
                 return cls.LONG
 
-    def __init__(self, input_dir_list, tp_pp_worker, sampling_policy):
+    def __init__(
+        self,
+        input_dir_list,
+        tp_pp_worker,
+        sampling_policy,
+        dp_request_ids,
+        partition,
+        seed,
+    ):
         self.datasets = {}
         self.context_groups = {}
         self.total_tokens = {kv: 0 for kv in TensorFileManager.KV}
         self.sampling_policy = sampling_policy
+        self.dp_request_ids = dp_request_ids
+        self.partition = partition
+        self.rng = random.Random(seed)
 
         for dataset_path in input_dir_list:
             self.datasets[dataset_path] = {}
@@ -399,7 +417,12 @@ class TensorFileManager(object):
         for seq in sequences:
             sequences[seq].sort(key=tensor_sorting_fn)
 
-        file_groups = list(sequences.values())
+        file_groups = [
+            paths
+            for sequence_id, paths in sequences.items()
+            if (sequence_id in self.dp_request_ids[tensor_dir])
+            == (self.partition == "dp")
+        ]
 
         ret = []
         counter = {b: 0 for b in TensorFileManager.Sequence}
@@ -464,7 +487,7 @@ class TensorFileManager(object):
 
     def get_token_budget(self, kv: KV, dataset_name, N, tensor):
         token_cnt = tensor.shape[0]
-        sink_tokens = 256
+        sink_tokens = SINK_TOKENS
 
         if self.sampling_policy == TensorFileManager.SamplingPolicy.STRICT:
             assert token_cnt >= 1000
@@ -547,6 +570,137 @@ class TensorFileManager(object):
             assert False, f"Invalid sampling policy {self.sampling_policy}"
 
 
+def reserve_dp_requests(input_dirs, worker, dp_sample_tokens, seed):
+    """Reserve whole requests per dataset/length bucket using one canonical worker."""
+    grouped = defaultdict(list)
+    for dataset_path in input_dirs:
+        worker_dir = dataset_path / worker
+        sequences = defaultdict(list)
+        for path in worker_dir.iterdir():
+            if path.is_file() and TensorFileManager.KV.K.value in path.name:
+                sequences[path.name.split(TensorFileManager.KV.K.value, 1)[0]].append(path)
+
+        for sequence_id, paths in sequences.items():
+            layer_zero = [
+                path
+                for path in paths
+                if re.search(r"chunk_\d+-layer_0\.bin$", path.name)
+            ]
+            if not layer_zero:
+                continue
+            try:
+                token_count = torch.concat(
+                    [torch.load(path, map_location="cpu") for path in layer_zero]
+                ).shape[0]
+            except Exception as error:
+                logger.warning(
+                    "Skipping %s while reserving DP requests: %s", sequence_id, error
+                )
+                continue
+            bucket = TensorFileManager.Sequence.bucket(token_count)
+            if bucket != TensorFileManager.Sequence.IGNORE:
+                grouped[(dataset_path, bucket)].append(
+                    (sequence_id, token_count - SINK_TOKENS)
+                )
+
+    if not grouped:
+        raise ValueError("No eligible requests are available for the DP holdout")
+
+    target_per_group = math.ceil(dp_sample_tokens / len(grouped))
+    reserved = {dataset_path: set() for dataset_path in input_dirs}
+    for group_index, ((dataset_path, bucket), candidates) in enumerate(
+        sorted(grouped.items(), key=lambda item: (str(item[0][0]), int(item[0][1])))
+    ):
+        rng = random.Random(seed + group_index)
+        candidates.sort()
+        rng.shuffle(candidates)
+        capacity = 0
+        for sequence_id, usable_tokens in candidates:
+            reserved[dataset_path].add(sequence_id)
+            capacity += usable_tokens
+            if capacity >= target_per_group:
+                break
+        if capacity < target_per_group:
+            raise ValueError(
+                f"DP holdout group {dataset_path}/{bucket.name.lower()} has only "
+                f"{capacity} usable tokens; {target_per_group} are required"
+            )
+        logger.info(
+            "Reserved %s requests with %s usable tokens for DP in %s/%s",
+            len(reserved[dataset_path]),
+            capacity,
+            dataset_path,
+            bucket.name.lower(),
+        )
+    return reserved
+
+
+def collect_sampled_data(
+    tensor_manager: TensorFileManager,
+    kv: TensorFileManager.KV,
+    sample_count: int,
+    undo_rope: bool,
+    purpose: str,
+):
+    sampled_data = []
+    collected_by_group = Counter()
+    for dataset_path in tensor_manager.datasets_list:
+        for paths in tensor_manager.datasets[dataset_path][kv]:
+            tensor, token_count = load_tensor(paths)
+            if tensor is None or token_count is None:
+                continue
+            if token_count < TensorFileManager.Sequence.SHORT:
+                logger.warning(
+                    "Skipping %s: only %s tokens after reconstruction",
+                    paths[0],
+                    token_count,
+                )
+                continue
+            try:
+                sampling_budget = tensor_manager.get_token_budget(
+                    kv, dataset_path, sample_count, tensor
+                )
+                if sampling_budget > token_count - SINK_TOKENS:
+                    raise ValueError(
+                        f"sampling budget {sampling_budget} exceeds the non-sink tokens "
+                        f"in {token_count}-token request"
+                    )
+                if undo_rope:
+                    tensor = Rope.invert_rope(tensor)
+                tensor = trim_sink_tokens(tensor)
+                sampled_data.append(
+                    sample_tokens(tensor, sampling_budget, tensor_manager.rng)
+                )
+                collected_by_group[
+                    (dataset_path, TensorFileManager.Sequence.bucket(token_count))
+                ] += sampling_budget
+            except (AssertionError, RuntimeError, ValueError) as error:
+                logger.warning("Skipping %s: %s", paths[0], error)
+
+    if not sampled_data:
+        raise RuntimeError(f"No valid {kv} dump requests remain for {purpose}")
+    data = transform_tensors(sampled_data)
+    if data.shape[0] < sample_count:
+        raise RuntimeError(
+            f"Collected only {data.shape[0]}/{sample_count} {kv} tokens for {purpose}"
+        )
+    if data.shape[0] > sample_count:
+        data = data[:sample_count]
+    for (dataset_path, bucket), collected in sorted(
+        collected_by_group.items(), key=lambda item: (str(item[0][0]), int(item[0][1]))
+    ):
+        logger.info(
+            "%s %s/%s sampled tokens from %s/%s",
+            purpose,
+            collected,
+            sample_count,
+            dataset_path,
+            bucket.name.lower(),
+        )
+    logger.info("Collected %s/%s %s tokens for %s", data.shape[0], sample_count, kv, purpose)
+    return data
+
+
 def SVD(
     tensor_manager: TensorFileManager,
     svd_dim: int,
@@ -564,45 +718,9 @@ def SVD(
     else:
         logger.info(f"Load tensors and sample")
 
-    sampled_data = []
-
-    for kv_cache_paths in tensor_manager.datasets_list:
-        for paths in tensor_manager.datasets[kv_cache_paths][kv]:
-            tensor, token_count = load_tensor(paths)
-            if tensor is None or token_count is None:
-                continue
-
-            if token_count < TensorFileManager.Sequence.SHORT:
-                logger.warning(
-                    "Skipping %s: only %s tokens after reconstruction",
-                    paths[0],
-                    token_count,
-                )
-                continue
-
-            try:
-                sampling_budget = tensor_manager.get_token_budget(
-                    kv, kv_cache_paths, N, tensor
-                )
-                if sampling_budget >= token_count - 2 * 128:
-                    raise ValueError(
-                        f"sampling budget {sampling_budget} leaves no non-sink tokens "
-                        f"in {token_count}-token request"
-                    )
-
-                if undo_rope:
-                    tensor = Rope.invert_rope(tensor)
-                tensor = trim_sink_tokens(tensor)
-                sampled_data.append(sample_tokens(tensor, sampling_budget))
-            except (AssertionError, RuntimeError, ValueError) as error:
-                logger.warning("Skipping %s: %s", paths[0], error)
-
-    pprint.pp([d.shape for d in sampled_data])
-
-    if not sampled_data:
-        raise RuntimeError(f"No valid {kv} dump requests remain for SVD")
-
-    input_tensor = transform_tensors(sampled_data)
+    input_tensor = collect_sampled_data(
+        tensor_manager, kv, N, undo_rope, "PCA"
+    )
 
     n, p = input_tensor.shape
     dtype = input_tensor.dtype
@@ -618,6 +736,158 @@ def SVD(
     logger.info(f"DONE SVD for data at")
 
     return per_feature_mean, U, S, Vh
+
+
+def simulate_quantization_error(values, dtype_name):
+    if dtype_name == "float32":
+        return 0.0
+    if dtype_name == "bfloat16":
+        reconstructed = values.to(torch.bfloat16).to(torch.float32)
+    else:
+        qmin, qmax = (-128, 127) if dtype_name == "int8" else (0, 15)
+        minimum = values.amin(dim=1, keepdim=True)
+        maximum = values.amax(dim=1, keepdim=True)
+        value_range = maximum - minimum
+        scale = torch.where(
+            value_range > 0,
+            value_range / (qmax - qmin),
+            torch.ones_like(value_range),
+        )
+        zero_point = qmin - torch.round(minimum / scale)
+        quantized = torch.clamp(torch.round(values / scale + zero_point), qmin, qmax)
+        reconstructed = (quantized - zero_point) * scale
+        reconstructed = torch.where(value_range > 0, reconstructed, values)
+    return float((values - reconstructed).square().sum().item())
+
+
+@dataclass(frozen=True)
+class DPRecord:
+    error: float
+    cost: int
+    previous: "DPRecord | None"
+    group: tuple[int, str] | None
+
+
+def _pareto_frontier(records):
+    best_by_cost = {}
+    for record in records:
+        current = best_by_cost.get(record.cost)
+        if current is None or record.error < current.error:
+            best_by_cost[record.cost] = record
+    frontier = {}
+    best_error = math.inf
+    for cost in sorted(best_by_cost):
+        record = best_by_cost[cost]
+        if record.error < best_error:
+            frontier[cost] = record
+            best_error = record.error
+    return frontier
+
+
+def assign_quantization(projected_data, original_feature_count, compression_ratio):
+    if not projected_data:
+        raise ValueError("No held-out projections were provided for quantization")
+    rank = projected_data[0].shape[1]
+    if any(data.shape[1] != rank for data in projected_data):
+        raise ValueError("Workers have inconsistent PCA ranks")
+
+    budget = math.floor(16 * original_feature_count / compression_ratio)
+    frontiers = [[{} for _ in QUANT_DTYPES] for _ in range(rank + 1)]
+    error_cache = {}
+
+    def block_error(start, size, dtype_name):
+        key = (start, size, dtype_name)
+        if key not in error_cache:
+            error_cache[key] = sum(
+                simulate_quantization_error(
+                    data[:, start : start + size], dtype_name
+                )
+                for data in projected_data
+            )
+        return error_cache[key]
+
+    for end in range(1, rank + 1):
+        for dtype_index, dtype_name in enumerate(QUANT_DTYPES):
+            block_sizes = INT4_BLOCK_SIZES if dtype_name == "int4" else QUANT_BLOCK_SIZES
+            candidates = []
+            for size in block_sizes:
+                start = end - size
+                group_cost = quant_group_bits(size, dtype_name)
+                if start < 0 or group_cost > budget:
+                    continue
+                quant_error = block_error(start, size, dtype_name)
+                if start == 0:
+                    candidates.append(
+                        DPRecord(quant_error, group_cost, None, (size, dtype_name))
+                    )
+                    continue
+                for previous_dtype in range(dtype_index + 1):
+                    for previous in frontiers[start][previous_dtype].values():
+                        cost = previous.cost + group_cost
+                        if cost <= budget:
+                            candidates.append(
+                                DPRecord(
+                                    previous.error + quant_error,
+                                    cost,
+                                    previous,
+                                    (size, dtype_name),
+                                )
+                            )
+            frontiers[end][dtype_index] = _pareto_frontier(candidates)
+
+    feature_energy = torch.zeros(rank, dtype=torch.float64)
+    for data in projected_data:
+        feature_energy += data.to(torch.float64).square().sum(dim=0)
+    tail_error = torch.cat(
+        (
+            torch.flip(torch.cumsum(torch.flip(feature_energy, (0,)), dim=0), (0,)),
+            torch.zeros(1, dtype=feature_energy.dtype),
+        )
+    )
+
+    best = None
+    best_total_error = math.inf
+    for end in range(1, rank + 1):
+        omitted_error = float(tail_error[end].item())
+        for dtype_frontier in frontiers[end]:
+            for record in dtype_frontier.values():
+                total_error = record.error + omitted_error
+                if total_error < best_total_error:
+                    best = record
+                    best_total_error = total_error
+    if best is None:
+        raise ValueError(
+            f"Compression ratio {compression_ratio} has a {budget}-bit budget, "
+            "which cannot fit a non-empty quantization schema"
+        )
+
+    schema = []
+    while best is not None:
+        schema.append(best.group)
+        best = best.previous
+    schema.reverse()
+
+    merged = []
+    for size, dtype_name in schema:
+        if merged and dtype_name in ("float32", "bfloat16") and merged[-1][1] == dtype_name:
+            merged[-1] = (merged[-1][0] + size, dtype_name)
+        else:
+            merged.append((size, dtype_name))
+    build_quant_layout(
+        merged,
+        page_size=1,
+        basis_rank=rank,
+        matrix_name="calibrated",
+    )
+    logger.info(
+        "DP ratio=%sx budget=%s bits used=%s error=%s schema=%s",
+        compression_ratio,
+        budget,
+        sum(quant_group_bits(size, dtype_name) for size, dtype_name in merged),
+        best_total_error,
+        merged,
+    )
+    return merged
 
 
 def init_logger(log_dir, filename, log_level):
@@ -719,6 +989,25 @@ def run():
         help="The total number of tokens to sample from the calibration dataset (default=200,000)",
     )
     parser.add_argument(
+        "--dp-sample-tokens",
+        type=int,
+        default=32768,
+        help="Number of tokens reserved from whole requests for DP quantization (default=32768)",
+    )
+    parser.add_argument(
+        "--compression-ratios",
+        type=int,
+        nargs="+",
+        required=True,
+        help="Positive integer compression ratios for which quantization schemas are generated",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for deterministic request partitioning and token sampling (default=0)",
+    )
+    parser.add_argument(
         "--niter",
         required=True,
         help="Please refer to 'niter' in torch.svd_lowrank in pytorch documentation",
@@ -763,10 +1052,16 @@ def run():
     output_path = Path(args.output)
     log_dir = Path(args.log_dir)
     N = args.sample_tokens
+    dp_sample_tokens = args.dp_sample_tokens
+    compression_ratios = list(dict.fromkeys(args.compression_ratios))
     svd_iter = int(args.niter)
     svd_dim = int(args.svd_dim)
     log_level = args.log_level
     sampling_policy = TensorFileManager.SamplingPolicy[args.sampling_policy.upper()]
+    if N <= 0 or dp_sample_tokens <= 0:
+        parser.error("PCA and DP sample token counts must be positive")
+    if any(ratio <= 0 for ratio in compression_ratios):
+        parser.error("Compression ratios must be positive integers")
 
     Rope.load_model_config(args.model_dir)
 
@@ -777,38 +1072,81 @@ def run():
     )
 
     input_dir_list, workers = discover_dump_directories(input_dir)
+    dp_request_ids = reserve_dp_requests(
+        input_dir_list, workers[0], dp_sample_tokens, args.seed
+    )
 
     output_dict = {
         "version": KVTC_FILE_VERSION,
-        "keys": {worker: {"mu": None, "basis": None} for worker in workers},
-        "values": {worker: {"mu": None, "basis": None} for worker in workers},
+        "keys": {
+            "quant": {},
+            **{worker: {"mu": None, "basis": None} for worker in workers},
+        },
+        "values": {
+            "quant": {},
+            **{worker: {"mu": None, "basis": None} for worker in workers},
+        },
     }
+    projected_dp = {kv: [] for kv in TensorFileManager.KV}
+    original_feature_counts = {kv: None for kv in TensorFileManager.KV}
 
     logger.info(
         f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
     )
 
     for worker in workers:
-        tensor_manager = TensorFileManager(input_dir_list, worker, sampling_policy)
+        pca_tensor_manager = TensorFileManager(
+            input_dir_list,
+            worker,
+            sampling_policy,
+            dp_request_ids,
+            "pca",
+            args.seed,
+        )
+        dp_tensor_manager = TensorFileManager(
+            input_dir_list,
+            worker,
+            sampling_policy,
+            dp_request_ids,
+            "dp",
+            args.seed,
+        )
         for kv in TensorFileManager.KV:
             undo_rope = kv == TensorFileManager.KV.K
-            try:
-                mu, U, S, V = SVD(
-                    tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
+            mu, U, S, V = SVD(
+                pca_tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
+            )
+            logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
+            dp_data = collect_sampled_data(
+                dp_tensor_manager,
+                kv,
+                dp_sample_tokens,
+                undo_rope,
+                "DP quantization",
+            )
+            projected_dp[kv].append((dp_data - mu) @ V)
+            feature_count = dp_data.shape[1]
+            if original_feature_counts[kv] not in (None, feature_count):
+                raise RuntimeError(
+                    f"Workers have inconsistent {kv} feature counts: "
+                    f"{original_feature_counts[kv]} and {feature_count}"
                 )
-                logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
-                if kv == TensorFileManager.KV.K:
-                    output_dict["keys"][worker]["basis"] = V
-                    output_dict["keys"][worker]["mu"] = mu
-                elif kv == TensorFileManager.KV.V:
-                    output_dict["values"][worker]["basis"] = V
-                    output_dict["values"][worker]["mu"] = mu
+            original_feature_counts[kv] = feature_count
 
-            except RuntimeError as e:
-                logger.exception('')
-                return
+            matrix_name = "keys" if kv == TensorFileManager.KV.K else "values"
+            output_dict[matrix_name][worker]["basis"] = V
+            output_dict[matrix_name][worker]["mu"] = mu
 
-        torch.save(output_dict, output_path)
+    for kv in TensorFileManager.KV:
+        matrix_name = "keys" if kv == TensorFileManager.KV.K else "values"
+        for compression_ratio in compression_ratios:
+            output_dict[matrix_name]["quant"][str(compression_ratio)] = assign_quantization(
+                projected_dp[kv],
+                original_feature_counts[kv],
+                compression_ratio,
+            )
+
+    torch.save(output_dict, output_path)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,14 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.kvtc_quant import (
+    KVTC_QUANT_METADATA_DTYPE,
+    KVTC_QUANT_PRECISION_BITS,
+    KVTC_QUANT_STORAGE_DTYPES,
+    KVTCQuantGroup as _KVTCQuantGroup,
+    KVTCQuantLayout as _KVTCQuantLayout,
+    build_quant_layout,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu, get_available_gpu_memory
 
 _is_cuda = is_cuda()
@@ -92,24 +100,6 @@ class KVTCHostMemoryRequest:
     device_indices_sink: torch.Tensor
     io_backend: str
     layer_id: int | None
-
-
-@dataclass(frozen=True)
-class _KVTCQuantGroup:
-    feature_start: int
-    feature_end: int
-    dtype_name: str
-    payload_start: int
-    payload_end: int
-    metadata_index: Optional[int]
-
-
-@dataclass(frozen=True)
-class _KVTCQuantLayout:
-    groups: tuple[_KVTCQuantGroup, ...]
-    feature_count: int
-    payload_elements: dict[str, int]
-    metadata_count: int
 
 
 class HostTensorAllocator:
@@ -3298,19 +3288,9 @@ class DSAIndexerPoolHost(HostKVCache):
         return ptr_list, [page_stride_bytes] * len(ptr_list)
 
 class NPUMHATokenToKVPoolCompressed(HostKVCache):
-    _QUANT_STORAGE_DTYPES = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "int4": torch.int32,
-        "int8": torch.int8,
-    }
-    _QUANT_PRECISION_BITS = {
-        "float32": 32,
-        "bfloat16": 16,
-        "int8": 8,
-        "int4": 4,
-    }
-    _QUANT_METADATA_DTYPE = torch.float16
+    _QUANT_STORAGE_DTYPES = KVTC_QUANT_STORAGE_DTYPES
+    _QUANT_PRECISION_BITS = KVTC_QUANT_PRECISION_BITS
+    _QUANT_METADATA_DTYPE = KVTC_QUANT_METADATA_DTYPE
 
     def __init__(
         self,
@@ -3489,72 +3469,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             )
 
         schema = quant_configs[ratio_key]
-        if not isinstance(schema, (list, tuple)) or not schema:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization schema {ratio_key!r} must be a non-empty list"
-            )
-
-        groups = []
-        feature_offset = 0
-        metadata_count = 0
-        previous_precision = None
-        payload_offsets = {dtype_name: 0 for dtype_name in self._QUANT_STORAGE_DTYPES}
-        for group_index, entry in enumerate(schema):
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                raise ValueError(
-                    f"{matrix_name} KVTC quantization entry {group_index} must be (group_size, dtype)"
-                )
-
-            group_size, dtype_name = entry
-            if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size <= 0:
-                raise ValueError(
-                    f"{matrix_name} KVTC quantization group {group_index} has invalid size {group_size!r}"
-                )
-            if dtype_name not in self._QUANT_STORAGE_DTYPES:
-                raise ValueError(
-                    f"{matrix_name} KVTC quantization group {group_index} has unsupported dtype {dtype_name!r}"
-                )
-            precision = self._QUANT_PRECISION_BITS[dtype_name]
-            if previous_precision is not None and precision > previous_precision:
-                raise ValueError(
-                    f"{matrix_name} KVTC quantization schema must use non-increasing precision; group {group_index} changes from {previous_precision} to {precision} bits"
-                )
-            previous_precision = precision
-
-            if dtype_name == "int4":
-                if group_size % 8 != 0:
-                    raise ValueError(
-                        f"{matrix_name} KVTC int4 group {group_index} has size {group_size}; packed int4 requires group size to be a multiple of 8"
-                    )
-                unpacked_elements = self.page_size * group_size
-                payload_elements = unpacked_elements // 8
-            else:
-                payload_elements = self.page_size * group_size
-
-            metadata_index = None
-            if dtype_name in ("int4", "int8"):
-                metadata_index = metadata_count
-                metadata_count += 1
-
-            payload_start = payload_offsets[dtype_name]
-            payload_end = payload_start + payload_elements
-            groups.append(
-                _KVTCQuantGroup(
-                    feature_start=feature_offset,
-                    feature_end=feature_offset + group_size,
-                    dtype_name=dtype_name,
-                    payload_start=payload_start,
-                    payload_end=payload_end,
-                    metadata_index=metadata_index,
-                )
-            )
-            feature_offset += group_size
-            payload_offsets[dtype_name] = payload_end
-
-        if feature_offset > basis_rank:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization schema retains {feature_offset} features, but basis rank is only {basis_rank}"
-            )
+        layout = build_quant_layout(
+            schema,
+            page_size=self.page_size,
+            basis_rank=basis_rank,
+            matrix_name=matrix_name,
+        )
 
         missing_ops = (
             [
@@ -3562,26 +3482,19 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 for op in ("npu_dynamic_quant_asymmetric", "npu_anti_quant")
                 if not hasattr(torch_npu, op)
             ]
-            if metadata_count > 0
+            if layout.metadata_count > 0
             else []
         )
         if missing_ops:
             raise RuntimeError(
                 f"{matrix_name} KVTC quantization requires missing torch-npu APIs: {', '.join(missing_ops)}"
             )
-        if metadata_count > 0 and self.dtype not in (torch.float16, torch.bfloat16):
+        if layout.metadata_count > 0 and self.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 f"{matrix_name} KVTC quantization requires an FP16 or BF16 device KV cache, got {self.dtype}"
             )
 
-        return _KVTCQuantLayout(
-            groups=tuple(groups),
-            feature_count=feature_offset,
-            payload_elements={
-                dtype_name: count for dtype_name, count in payload_offsets.items() if count > 0
-            },
-            metadata_count=metadata_count,
-        )
+        return layout
 
     def _get_matrix_page_size_bytes(
         self,
