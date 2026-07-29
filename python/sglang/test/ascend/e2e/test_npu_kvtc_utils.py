@@ -23,7 +23,7 @@ logger = logging.getLogger("kvtc_utils")
 
 
 KVTC_REPO_PATH = Path(__file__).resolve().parents[5]
-KVTC_CACHE_PATH = Path("/root/.cache/KVTC")
+KVTC_CACHE_PATH = os.getenv("SGLANG_KVTC_CACHE_PATH", Path("/root/.cache/KVTC"))
 KVTC_DATASETS_PATH = KVTC_REPO_PATH / "python/sglang/test/ascend/e2e"
 KVTC_CALIBRATION_PATH = KVTC_CACHE_PATH / "calibrations"
 KVTC_DUMP_METADATA_FILENAME = "metadata.json"
