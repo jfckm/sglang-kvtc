@@ -966,12 +966,64 @@ def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
     return dump_dirs, workers
 
 
+def load_pca_artifact(path: Path, workers: list[str]):
+    if not path.is_file():
+        raise ValueError(f"PCA calibration file does not exist: {path}")
+    artifact = torch.load(path, map_location="cpu")
+    if not isinstance(artifact, dict):
+        raise ValueError(f"PCA calibration file must contain a dictionary: {path}")
+
+    output = {"version": KVTC_FILE_VERSION}
+    for matrix_name in ("keys", "values"):
+        matrix_params = artifact.get(matrix_name)
+        if not isinstance(matrix_params, dict):
+            raise ValueError(f"PCA calibration file is missing {matrix_name!r}: {path}")
+        artifact_workers = sorted(key for key in matrix_params if key != "quant")
+        if artifact_workers != sorted(workers):
+            raise ValueError(
+                f"PCA calibration {matrix_name} workers {artifact_workers} do not match "
+                f"dump workers {sorted(workers)}"
+            )
+
+        output[matrix_name] = {"quant": {}}
+        for worker in workers:
+            worker_params = matrix_params.get(worker)
+            if not isinstance(worker_params, dict):
+                raise ValueError(
+                    f"PCA calibration file has invalid {matrix_name}/{worker} parameters"
+                )
+            mu = worker_params.get("mu")
+            basis = worker_params.get("basis")
+            if not isinstance(mu, torch.Tensor) or mu.ndim != 1:
+                raise ValueError(
+                    f"PCA calibration {matrix_name}/{worker}/mu must be a 1-D tensor"
+                )
+            if (
+                not isinstance(basis, torch.Tensor)
+                or basis.ndim != 2
+                or basis.shape[0] != mu.shape[0]
+                or basis.shape[1] == 0
+            ):
+                raise ValueError(
+                    f"PCA calibration {matrix_name}/{worker}/basis must have shape "
+                    f"({mu.shape[0]}, rank>0)"
+                )
+            output[matrix_name][worker] = {"mu": mu, "basis": basis}
+
+    logger.info(
+        "Reusing PCA parameters from %s (source version=%s)",
+        path,
+        artifact.get("version", "<missing>"),
+    )
+    return output
+
+
 def run():
     parser = argparse.ArgumentParser(
         usage=(
             f"\n{os.path.basename(__file__)}"
-            " -N <token_sample_count> --niter <the number of subspace iterations for svd_lowrank>"
-            " -q <a slightly overestimated rank of svd matrix>"
+            " (-N <token_sample_count> --niter <svd iterations> -q <svd rank>"
+            " | --reuse-pca <calibration_file>)"
             " -i <dump-parent-directory>"
             " -o <output_path> -m <model_path>\n"
         )
@@ -985,8 +1037,12 @@ def run():
         "-N",
         "--sample-tokens",
         type=int,
-        required=True,
-        help="The total number of tokens to sample from the calibration dataset (default=200,000)",
+        help="Number of PCA fitting tokens; required unless --reuse-pca is used",
+    )
+    parser.add_argument(
+        "--reuse-pca",
+        type=Path,
+        help="Existing calibration file whose PCA means and bases are reused; skips PCA fitting",
     )
     parser.add_argument(
         "--dp-sample-tokens",
@@ -1009,13 +1065,13 @@ def run():
     )
     parser.add_argument(
         "--niter",
-        required=True,
+        type=int,
         help="Please refer to 'niter' in torch.svd_lowrank in pytorch documentation",
     )
     parser.add_argument(
         "-q",
         "--svd_dim",
-        required=True,
+        type=int,
         help="Please refer to 'q' in torch.svd_lowrank in pytorch documentation",
     )
     parser.add_argument(
@@ -1054,12 +1110,22 @@ def run():
     N = args.sample_tokens
     dp_sample_tokens = args.dp_sample_tokens
     compression_ratios = list(dict.fromkeys(args.compression_ratios))
-    svd_iter = int(args.niter)
-    svd_dim = int(args.svd_dim)
+    svd_iter = args.niter
+    svd_dim = args.svd_dim
     log_level = args.log_level
     sampling_policy = TensorFileManager.SamplingPolicy[args.sampling_policy.upper()]
-    if N <= 0 or dp_sample_tokens <= 0:
-        parser.error("PCA and DP sample token counts must be positive")
+    if args.reuse_pca is None:
+        if N is None or svd_iter is None or svd_dim is None:
+            parser.error(
+                "-N/--sample-tokens, --niter, and -q/--svd_dim are required "
+                "for PCA fitting"
+            )
+        if N <= 0:
+            parser.error("PCA sample token count must be positive")
+    elif N is not None or svd_iter is not None or svd_dim is not None:
+        parser.error("PCA fitting options cannot be combined with --reuse-pca")
+    if dp_sample_tokens <= 0:
+        parser.error("DP sample token count must be positive")
     if any(ratio <= 0 for ratio in compression_ratios):
         parser.error("Compression ratios must be positive integers")
 
@@ -1067,41 +1133,65 @@ def run():
 
     init_logger(
         log_dir,
-        f"svd-q{svd_dim}_iter{svd_iter}_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log",
+        (
+            f"dp-reuse_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log"
+            if args.reuse_pca is not None
+            else f"svd-q{svd_dim}_iter{svd_iter}_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log"
+        ),
         log_level,
     )
 
     input_dir_list, workers = discover_dump_directories(input_dir)
+    reused_output = (
+        load_pca_artifact(args.reuse_pca, workers)
+        if args.reuse_pca is not None
+        else None
+    )
     dp_request_ids = reserve_dp_requests(
         input_dir_list, workers[0], dp_sample_tokens, args.seed
     )
 
-    output_dict = {
-        "version": KVTC_FILE_VERSION,
-        "keys": {
-            "quant": {},
-            **{worker: {"mu": None, "basis": None} for worker in workers},
-        },
-        "values": {
-            "quant": {},
-            **{worker: {"mu": None, "basis": None} for worker in workers},
-        },
-    }
+    if reused_output is not None:
+        output_dict = reused_output
+    else:
+        output_dict = {
+            "version": KVTC_FILE_VERSION,
+            "keys": {
+                "quant": {},
+                **{worker: {"mu": None, "basis": None} for worker in workers},
+            },
+            "values": {
+                "quant": {},
+                **{worker: {"mu": None, "basis": None} for worker in workers},
+            },
+        }
     projected_dp = {kv: [] for kv in TensorFileManager.KV}
     original_feature_counts = {kv: None for kv in TensorFileManager.KV}
 
     logger.info(
-        f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
+        "-------------------- model=%s PCA=%s DP_N=%s ratios=%s --------------------",
+        args.model_dir,
+        (
+            args.reuse_pca
+            if args.reuse_pca is not None
+            else f"N={N} q={svd_dim} iter={svd_iter}"
+        ),
+        dp_sample_tokens,
+        compression_ratios,
     )
 
     for worker in workers:
-        pca_tensor_manager = TensorFileManager(
-            input_dir_list,
-            worker,
-            sampling_policy,
-            dp_request_ids,
-            "pca",
-            args.seed,
+        pca_tensor_manager = (
+            None
+            if args.reuse_pca is not None
+            else TensorFileManager(
+                input_dir_list,
+                worker,
+                sampling_policy,
+                dp_request_ids,
+                "pca",
+                args.seed,
+            )
         )
         dp_tensor_manager = TensorFileManager(
             input_dir_list,
@@ -1113,10 +1203,22 @@ def run():
         )
         for kv in TensorFileManager.KV:
             undo_rope = kv == TensorFileManager.KV.K
-            mu, U, S, V = SVD(
-                pca_tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
-            )
-            logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
+            matrix_name = "keys" if kv == TensorFileManager.KV.K else "values"
+            if args.reuse_pca is not None:
+                mu = output_dict[matrix_name][worker]["mu"]
+                V = output_dict[matrix_name][worker]["basis"]
+                logger.info(
+                    "Reusing %s/%s PCA tensors mu=%s basis=%s",
+                    matrix_name,
+                    worker,
+                    mu.shape,
+                    V.shape,
+                )
+            else:
+                mu, U, S, V = SVD(
+                    pca_tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
+                )
+                logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
             dp_data = collect_sampled_data(
                 dp_tensor_manager,
                 kv,
@@ -1133,7 +1235,6 @@ def run():
                 )
             original_feature_counts[kv] = feature_count
 
-            matrix_name = "keys" if kv == TensorFileManager.KV.K else "values"
             output_dict[matrix_name][worker]["basis"] = V
             output_dict[matrix_name][worker]["mu"] = mu
 
