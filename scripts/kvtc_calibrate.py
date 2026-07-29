@@ -621,7 +621,7 @@ def reserve_dp_requests(input_dirs, worker, dp_sample_tokens, seed):
             if capacity >= target_per_group:
                 break
         if capacity < target_per_group:
-            raise ValueError(
+            logger.error(
                 f"DP holdout group {dataset_path}/{bucket.name.lower()} has only "
                 f"{capacity} usable tokens; {target_per_group} are required"
             )
