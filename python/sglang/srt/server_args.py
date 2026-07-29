@@ -708,6 +708,7 @@ class ServerArgs:
     hicache_kvtc_params: str = ""
     hicache_kvtc_k_cr: float = 0.0
     hicache_kvtc_v_cr: float = 0.0
+    hicache_kvtc_quant_disable: bool = False
     hicache_kvtc_sliding_window: int = 0
     dump_kv_path: str = ""
 
@@ -6614,6 +6615,11 @@ class ServerArgs:
             type=float,
             default=ServerArgs.hicache_kvtc_v_cr,
             help="KVTC compression ratio of the V cache",
+        )
+        parser.add_argument(
+            "--hicache-kvtc-quant-disable",
+            action="store_true",
+            help="Disable KVTC quantization and use the legacy FP32 PCA cutoff path",
         )
         parser.add_argument(
             "--hicache-kvtc-sw",

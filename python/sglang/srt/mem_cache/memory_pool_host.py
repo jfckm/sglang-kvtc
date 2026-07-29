@@ -3321,6 +3321,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         kvtc_params_path: str = "",
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
+        kvtc_quant_disable: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
         tp_size: int = 1,
@@ -3332,6 +3333,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.page_size = page_size
         self.device = "cpu"
         self.dtype = device_pool.store_dtype
+        self.compressed_dtype = torch.float32
+        self.kvtc_quant_disable = kvtc_quant_disable
         self.rotary_emb = rotary_emb
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
@@ -3376,13 +3379,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 if keys_params is None:
                     raise Exception(f"Wrong K KVTC config - missing {worker_key}")
 
-                self.k_quant_layout = self._load_quant_layout(
-                    kvtc_params["keys"],
-                    kvtc_k_compression_ratio,
-                    keys_params["basis"].shape[1],
-                    "K",
-                )
-                k_dim_limit = self.k_quant_layout.feature_count
+                if self.kvtc_quant_disable:
+                    k_dim_limit = p // int(kvtc_k_compression_ratio)
+                else:
+                    self.k_quant_layout = self._load_quant_layout(
+                        kvtc_params["keys"],
+                        kvtc_k_compression_ratio,
+                        keys_params["basis"].shape[1],
+                        "K",
+                    )
+                    k_dim_limit = self.k_quant_layout.feature_count
 
                 self.kvtc_k_mu = self._copy_with_trim(keys_params["mu"])
 
@@ -3410,13 +3416,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 if values_params is None:
                     raise Exception(f"Wrong V KVTC config - missing {worker_key}")
 
-                self.v_quant_layout = self._load_quant_layout(
-                    kvtc_params["values"],
-                    kvtc_v_compression_ratio,
-                    values_params["basis"].shape[1],
-                    "V",
-                )
-                v_dim_limit = self.v_quant_layout.feature_count
+                if self.kvtc_quant_disable:
+                    v_dim_limit = p // int(kvtc_v_compression_ratio)
+                else:
+                    self.v_quant_layout = self._load_quant_layout(
+                        kvtc_params["values"],
+                        kvtc_v_compression_ratio,
+                        values_params["basis"].shape[1],
+                        "V",
+                    )
+                    v_dim_limit = self.v_quant_layout.feature_count
 
                 self.kvtc_v_mu = self._copy_with_trim(values_params["mu"])
 
@@ -3440,6 +3449,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
         self.page_size_bytes = self._get_page_size_bytes()
         self.size_per_token = self.page_size_bytes / self.page_size
+        self._log_effective_compression_ratio(p)
         if host_size > 0:
             self.page_num = int(host_size * 1e9 // self.page_size_bytes) + 1
         else:
@@ -3574,7 +3584,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         )
 
     def _get_matrix_page_size_bytes(
-        self, enabled: bool, layout: Optional[_KVTCQuantLayout]
+        self,
+        enabled: bool,
+        layout: Optional[_KVTCQuantLayout],
+        feature_count: Optional[int] = None,
     ) -> int:
         if not enabled:
             return (
@@ -3584,6 +3597,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 * self.head_dim
                 * self.dtype.itemsize
             )
+
+        if self.kvtc_quant_disable:
+            assert feature_count is not None
+            return self.page_size * feature_count * self.compressed_dtype.itemsize
 
         payload_bytes = sum(
             element_count * self._QUANT_STORAGE_DTYPES[dtype_name].itemsize
@@ -3599,8 +3616,33 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
     def _get_page_size_bytes(self) -> int:
         return self._get_matrix_page_size_bytes(
-            self.k_kvtc, self.k_quant_layout
-        ) + self._get_matrix_page_size_bytes(self.v_kvtc, self.v_quant_layout)
+            self.k_kvtc,
+            self.k_quant_layout,
+            self.offload_page_shape_k[1] if self.k_kvtc else None,
+        ) + self._get_matrix_page_size_bytes(
+            self.v_kvtc,
+            self.v_quant_layout,
+            self.offload_page_shape_v[1] if self.v_kvtc else None,
+        )
+
+    def _log_effective_compression_ratio(self, feature_count: int) -> None:
+        baseline_bytes = feature_count * self.dtype.itemsize
+        k_bytes = self._get_matrix_page_size_bytes(
+            self.k_kvtc,
+            self.k_quant_layout,
+            self.offload_page_shape_k[1] if self.k_kvtc else None,
+        ) / self.page_size
+        v_bytes = self._get_matrix_page_size_bytes(
+            self.v_kvtc,
+            self.v_quant_layout,
+            self.offload_page_shape_v[1] if self.v_kvtc else None,
+        ) / self.page_size
+        logger.info(
+            "KVTC effective compression ratio: %.2fx (K: %.2fx, V: %.2fx)",
+            2 * baseline_bytes / (k_bytes + v_bytes),
+            baseline_bytes / k_bytes,
+            baseline_bytes / v_bytes,
+        )
 
     def _copy_with_trim(self, in_tensor: torch.Tensor, out_shape=None) -> torch.Tensor:
         out_shape = out_shape or in_tensor.shape
@@ -3634,13 +3676,20 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         # Continuous memory improves the efficiency of Ascend`s transmission backend,
         # while other backends remain unchanged.
-        if self.k_kvtc:
+        if self.k_kvtc and not self.kvtc_quant_disable:
             (
                 self.k_quant_buffers,
                 self.k_quant_scales,
                 self.k_quant_offsets,
             ) = self._allocate_quant_buffers(self.k_quant_layout)
             self.k_buffer = self.k_quant_buffers
+        elif self.k_kvtc:
+            self.k_buffer = torch.zeros(
+                (self.page_num, *self.offload_page_shape_k),
+                dtype=self.compressed_dtype,
+                device=self.device,
+                pin_memory=True,
+            )
         else:
             self.k_buffer = torch.zeros(
                 (
@@ -3655,13 +3704,20 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 pin_memory=True,
             )
 
-        if self.v_kvtc:
+        if self.v_kvtc and not self.kvtc_quant_disable:
             (
                 self.v_quant_buffers,
                 self.v_quant_scales,
                 self.v_quant_offsets,
             ) = self._allocate_quant_buffers(self.v_quant_layout)
             self.v_buffer = self.v_quant_buffers
+        elif self.v_kvtc:
+            self.v_buffer = torch.zeros(
+                (self.page_num, *self.offload_page_shape_v),
+                dtype=self.compressed_dtype,
+                device=self.device,
+                pin_memory=True,
+            )
         else:
             self.v_buffer = torch.zeros(
                 (
@@ -3683,7 +3739,11 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
     def get_ksize_per_token(self):
         return (
-            self._get_matrix_page_size_bytes(self.k_kvtc, self.k_quant_layout)
+            self._get_matrix_page_size_bytes(
+                self.k_kvtc,
+                self.k_quant_layout,
+                self.offload_page_shape_k[1] if self.k_kvtc else None,
+            )
             / self.page_size
         )
 
@@ -3816,13 +3876,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
 
             if self.k_kvtc:
-                D_k = self._dequantize_page(
-                    host_page,
-                    self.k_quant_layout,
-                    self.k_quant_buffers,
-                    self.k_quant_scales,
-                    self.k_quant_offsets,
-                )
+                if self.kvtc_quant_disable:
+                    D_k = self.k_buffer[host_page].to(device=self.device_pool.device)
+                else:
+                    D_k = self._dequantize_page(
+                        host_page,
+                        self.k_quant_layout,
+                        self.k_quant_buffers,
+                        self.k_quant_scales,
+                        self.k_quant_offsets,
+                    )
                 X_k = (
                     torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
                     + self.kvtc_k_mu
@@ -3843,13 +3906,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
 
             if self.v_kvtc:
-                D_v = self._dequantize_page(
-                    host_page,
-                    self.v_quant_layout,
-                    self.v_quant_buffers,
-                    self.v_quant_scales,
-                    self.v_quant_offsets,
-                )
+                if self.kvtc_quant_disable:
+                    D_v = self.v_buffer[host_page].to(device=self.device_pool.device)
+                else:
+                    D_v = self._dequantize_page(
+                        host_page,
+                        self.v_quant_layout,
+                        self.v_quant_buffers,
+                        self.v_quant_scales,
+                        self.v_quant_offsets,
+                    )
                 X_v = (
                     (
                         torch.matmul(
@@ -3888,14 +3954,17 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 D_k = torch.matmul(
                     (X_k_unrotated.reshape(self.page_size, -1) - self.kvtc_k_mu), self.kvtc_k_V
                 )
-                self._quantize_page(
-                    D_k,
-                    host_page,
-                    self.k_quant_layout,
-                    self.k_quant_buffers,
-                    self.k_quant_scales,
-                    self.k_quant_offsets,
-                )
+                if self.kvtc_quant_disable:
+                    self.k_buffer[host_page] = D_k.to(device=self.device)
+                else:
+                    self._quantize_page(
+                        D_k,
+                        host_page,
+                        self.k_quant_layout,
+                        self.k_quant_buffers,
+                        self.k_quant_scales,
+                        self.k_quant_offsets,
+                    )
             else:
                 self.k_buffer[:, host_page, ...] = device_pool.k_buffer[:, device_page, ...].to(
                     device=self.device
@@ -3908,14 +3977,17 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     .reshape(self.page_size, -1)
                 )
                 D_v = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V)
-                self._quantize_page(
-                    D_v,
-                    host_page,
-                    self.v_quant_layout,
-                    self.v_quant_buffers,
-                    self.v_quant_scales,
-                    self.v_quant_offsets,
-                )
+                if self.kvtc_quant_disable:
+                    self.v_buffer[host_page] = D_v.to(device=self.device)
+                else:
+                    self._quantize_page(
+                        D_v,
+                        host_page,
+                        self.v_quant_layout,
+                        self.v_quant_buffers,
+                        self.v_quant_scales,
+                        self.v_quant_offsets,
+                    )
             else:
                 self.v_buffer[:, host_page, ...] = device_pool.v_buffer[:, device_page, ...].to(
                     device=self.device
@@ -3961,6 +4033,7 @@ class NPUMHATokenToKVPoolHybrid:
         kvtc_params_path: str = "",
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
+        kvtc_quant_disable: bool = False,
         enable_memory_saver: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
@@ -3986,6 +4059,7 @@ class NPUMHATokenToKVPoolHybrid:
                 kvtc_params_path=kvtc_params_path,
                 kvtc_k_compression_ratio=kvtc_k_compression_ratio,
                 kvtc_v_compression_ratio=kvtc_v_compression_ratio,
+                kvtc_quant_disable=kvtc_quant_disable,
                 rotary_emb=rotary_emb,
                 tp_rank=tp_rank,
                 tp_size=tp_size,
