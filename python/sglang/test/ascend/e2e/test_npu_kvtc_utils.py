@@ -174,7 +174,7 @@ class _AscendKvtcTestCaseBase:
             prompt = entry
             async with semaphore:
                 logger.debug(
-                    "KVTC dump %s request %s", dataset_name
+                    "KVTC dump %s request", dataset_name
                 )
                 try:
                     await client.chat.completions.create(
