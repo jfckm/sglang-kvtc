@@ -1204,6 +1204,7 @@ def run():
         for kv in TensorFileManager.KV:
             undo_rope = kv == TensorFileManager.KV.K
             matrix_name = "keys" if kv == TensorFileManager.KV.K else "values"
+
             if args.reuse_pca is not None:
                 mu = output_dict[matrix_name][worker]["mu"]
                 V = output_dict[matrix_name][worker]["basis"]
@@ -1219,6 +1220,7 @@ def run():
                     pca_tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
                 )
                 logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
+
             dp_data = collect_sampled_data(
                 dp_tensor_manager,
                 kv,
@@ -1226,8 +1228,10 @@ def run():
                 undo_rope,
                 "DP quantization",
             )
+
             projected_dp[kv].append((dp_data - mu) @ V)
             feature_count = dp_data.shape[1]
+
             if original_feature_counts[kv] not in (None, feature_count):
                 raise RuntimeError(
                     f"Workers have inconsistent {kv} feature counts: "
