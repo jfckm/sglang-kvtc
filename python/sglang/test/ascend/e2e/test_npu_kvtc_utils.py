@@ -6,6 +6,8 @@ import logging
 import shutil
 import subprocess
 import sys
+import os
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -24,7 +26,6 @@ KVTC_REPO_PATH = Path(__file__).resolve().parents[5]
 KVTC_CACHE_PATH = Path("/root/.cache/KVTC")
 KVTC_DATASETS_PATH = KVTC_REPO_PATH / "python/sglang/test/ascend/e2e"
 KVTC_CALIBRATION_PATH = KVTC_CACHE_PATH / "calibrations"
-KVTC_CALIBRATION_LOCK_PATH = KVTC_CACHE_PATH / ".calibration.lock"
 KVTC_DUMP_METADATA_FILENAME = "metadata.json"
 KVTC_CALIBRATION_METADATA_FILENAME = "calibration.metadata.json"
 KVTC_CALIBRATION_FILENAME = "kvtc.pt"
@@ -58,6 +59,7 @@ class _AscendKvtcTestCaseBase:
     kvtc_dataset_config = KVTC_DATASET_CONFIG
     kvtc_client_concurrency = 16
     kvtc_limit_calibration = 0
+    kvtc_force_calibration = False
 
     kvtc_calibration_params = KVTC_CALIBRATION_PARAMS
 
@@ -115,6 +117,12 @@ class _AscendKvtcTestCaseBase:
         cls.kvtc_dump_path = cls.kvtc_artifact_path / "dump"
         cls.kvtc_calibration_path = (
             cls.kvtc_artifact_path / cls._get_kvtc_calibration_version() / KVTC_CALIBRATION_FILENAME
+        )
+
+    @classmethod
+    def _get_kvtc_artifact_lock_path(cls) -> Path:
+        return cls.kvtc_artifact_path.with_name(
+            f".{cls.kvtc_artifact_path.name}.lock"
         )
 
     @classmethod
@@ -206,14 +214,10 @@ class _AscendKvtcTestCaseBase:
 
     @classmethod
     def _remove_incomplete_dump(cls) -> None:
-        for dump_path in (
-            cls.kvtc_dump_path,
-            cls.kvtc_dump_path.with_name("dump.tmp"),
-        ):
-            if dump_path.is_dir():
-                shutil.rmtree(dump_path)
-            elif dump_path.exists():
-                dump_path.unlink()
+        if cls.kvtc_dump_path.is_dir():
+            shutil.rmtree(cls.kvtc_dump_path)
+        elif cls.kvtc_dump_path.exists():
+            cls.kvtc_dump_path.unlink()
 
     @classmethod
     def _create_kvtc_dump(cls) -> None:
@@ -224,7 +228,9 @@ class _AscendKvtcTestCaseBase:
             dataset_prompts[dataset_name] = prompts
 
         cls._remove_incomplete_dump()
-        staging_path = cls.kvtc_dump_path.with_name("dump.tmp")
+        staging_path = cls.kvtc_dump_path.with_name(
+            f".{cls.kvtc_dump_path.name}.tmp-{uuid.uuid4().hex}"
+        )
         staging_path.mkdir(parents=True)
 
         original_args = cls.other_args
@@ -286,9 +292,8 @@ class _AscendKvtcTestCaseBase:
         cls.kvtc_artifact_path.mkdir(parents=True, exist_ok=True)
         cls.kvtc_calibration_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = cls.kvtc_calibration_path.with_suffix(
-            cls.kvtc_calibration_path.suffix + ".tmp"
+            f"{cls.kvtc_calibration_path.suffix}.tmp-{uuid.uuid4().hex}"
         )
-        temporary_path.unlink(missing_ok=True)
         logger.info("Calibrating KVTC dump: %s", cls.kvtc_dump_path)
         try:
             p = subprocess.run(
@@ -337,12 +342,22 @@ class _AscendKvtcTestCaseBase:
 
     @classmethod
     def _ensure_kvtc_artifacts(cls) -> None:
-        KVTC_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-        logger.info("Waiting for KVTC calibration lock: %s", KVTC_CALIBRATION_LOCK_PATH)
-        with KVTC_CALIBRATION_LOCK_PATH.open("w") as lock:
+        if not cls.kvtc_force_calibration and cls._has_current_kvtc_calibration():
+            logger.info(
+                "Reusing KVTC calibration: %s", cls.kvtc_calibration_path
+            )
+            return
+
+        lock_path = cls._get_kvtc_artifact_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Waiting for KVTC artifact lock: %s", lock_path)
+        with lock_path.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                if cls._has_current_kvtc_calibration():
+                if (
+                    not cls.kvtc_force_calibration
+                    and cls._has_current_kvtc_calibration()
+                ):
                     logger.info(
                         "Reusing KVTC calibration: %s", cls.kvtc_calibration_path
                     )
