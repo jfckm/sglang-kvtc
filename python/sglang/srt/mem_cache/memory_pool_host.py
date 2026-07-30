@@ -3363,10 +3363,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     k_dim_limit = p // int(kvtc_k_compression_ratio)
                 else:
                     self.k_quant_layout = self._load_quant_layout(
-                        kvtc_params["keys"],
+                        keys_params,
                         kvtc_k_compression_ratio,
                         keys_params["basis"].shape[1],
-                        "K",
+                        f"K/{worker_key}",
                     )
                     k_dim_limit = self.k_quant_layout.feature_count
 
@@ -3400,10 +3400,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     v_dim_limit = p // int(kvtc_v_compression_ratio)
                 else:
                     self.v_quant_layout = self._load_quant_layout(
-                        kvtc_params["values"],
+                        values_params,
                         kvtc_v_compression_ratio,
                         values_params["basis"].shape[1],
-                        "V",
+                        f"V/{worker_key}",
                     )
                     v_dim_limit = self.v_quant_layout.feature_count
 

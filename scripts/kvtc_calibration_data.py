@@ -1,0 +1,581 @@
+from __future__ import annotations
+
+import logging
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from pathlib import Path
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
+LAYER_ZERO_PATTERN = re.compile(r"chunk_\d+-layer_0\.bin$")
+SINK_TOKENS = 256
+
+
+class SamplingPolicy(Enum):
+    STRICT = "strict"
+    RELAXED = "relaxed"
+    OPEN = "open"
+
+
+class KV(str, Enum):
+    K = "-K-"
+    V = "-V-"
+
+    @property
+    def matrix_name(self) -> str:
+        return "keys" if self is KV.K else "values"
+
+
+class SequenceBucket(IntEnum):
+    IGNORE = 0
+    SHORT = 1000
+    LONG = 8000
+
+    @classmethod
+    def for_length(cls, length: int) -> "SequenceBucket":
+        if length < cls.SHORT:
+            return cls.IGNORE
+        if length < cls.LONG:
+            return cls.SHORT
+        return cls.LONG
+
+
+@dataclass(frozen=True)
+class DumpTensorSet:
+    dataset: Path
+    request_id: str
+    worker: str
+    kv: KV
+    paths: tuple[Path, ...]
+    token_count: int
+    bucket: SequenceBucket
+
+    @property
+    def usable_tokens(self) -> int:
+        return self.token_count - SINK_TOKENS
+
+
+@dataclass(frozen=True)
+class SampleAllocation:
+    tensor_set: DumpTensorSet
+    token_count: int
+
+
+class Rope:
+    rotary_emb = None
+    rotary_dim = None
+    is_neox_style = None
+
+    @classmethod
+    def ensure_server_args(cls) -> None:
+        from sglang.srt.server_args import (
+            ServerArgs,
+            get_global_server_args,
+            set_global_server_args_for_scheduler,
+        )
+
+        try:
+            get_global_server_args()
+        except ValueError:
+            set_global_server_args_for_scheduler(ServerArgs(model_path="DUMMY"))
+
+    @classmethod
+    def load_model_config(cls, model_path: str) -> None:
+        from transformers import AutoConfig
+
+        from sglang.srt.layers.rotary_embedding.factory import get_rope
+        from sglang.srt.utils.hf_transformers.common import get_rope_config
+
+        logger.info("Loading config from %s", model_path)
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
+        rope_theta, rope_scaling = get_rope_config(cfg)
+        rope_theta = float(rope_theta)
+
+        if rope_scaling and "mrope_section" in rope_scaling:
+            raise ValueError(
+                "Calibration does not support mRoPE models because KV dumps do not "
+                "include the required multimodal position IDs."
+            )
+
+        head_dim = getattr(cfg, "head_dim", None)
+        if head_dim is None:
+            head_dim = cfg.hidden_size // cfg.num_attention_heads
+
+        cls.ensure_server_args()
+        cls.rotary_emb = get_rope(
+            head_size=int(head_dim),
+            rotary_dim=int(head_dim),
+            max_position=int(getattr(cfg, "max_position_embeddings", 32768)),
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            partial_rotary_factor=float(getattr(cfg, "partial_rotary_factor", 1.0)),
+            is_neox_style=getattr(cfg, "rope_is_neox_style", True),
+            dtype=torch.float32,
+        )
+        if not hasattr(cls.rotary_emb, "cos_sin_cache"):
+            raise ValueError(
+                "Calibration only supports Qwen3-compatible 1-D RoPE variants "
+                "with a direct cos/sin cache."
+            )
+
+        cls.rotary_dim = cls.rotary_emb.rotary_dim
+        cls.is_neox_style = cls.rotary_emb.is_neox_style
+        logger.info(
+            "model.rope theta=%s rotary_dim=%s neox_style=%s scaling=%s",
+            rope_theta,
+            cls.rotary_dim,
+            cls.is_neox_style,
+            rope_scaling,
+        )
+
+    @classmethod
+    def invert(cls, tensor: torch.Tensor) -> torch.Tensor:
+        tokens = tensor.shape[0]
+        assert tokens <= 64 * 1024, f"{tokens=}"
+        assert cls.rotary_emb is not None, "RoPE model config was not loaded"
+
+        cos_sin_cache = cls.rotary_emb.cos_sin_cache
+        if tokens > cos_sin_cache.shape[0]:
+            raise ValueError(
+                f"Dump has {tokens} tokens, but the model RoPE cache has only "
+                f"{cos_sin_cache.shape[0]} positions."
+            )
+
+        cos, sin = cos_sin_cache[:tokens].chunk(2, dim=-1)
+        cos = cos[:, None, None, :].to(tensor.dtype)
+        sin = sin[:, None, None, :].to(tensor.dtype)
+        denominator = (cos.square() + sin.square()).clamp_min(
+            torch.finfo(tensor.dtype).eps
+        )
+        rotated = tensor[..., : cls.rotary_dim]
+        passthrough = tensor[..., cls.rotary_dim :]
+        if cls.is_neox_style:
+            first, second = torch.chunk(rotated, 2, dim=-1)
+            inverted = torch.cat(
+                (
+                    (first * cos + second * sin) / denominator,
+                    (second * cos - first * sin) / denominator,
+                ),
+                dim=-1,
+            )
+        else:
+            first, second = rotated[..., ::2], rotated[..., 1::2]
+            inverted = torch.stack(
+                (
+                    (first * cos + second * sin) / denominator,
+                    (second * cos - first * sin) / denominator,
+                ),
+                dim=-1,
+            ).flatten(-2)
+        return torch.cat((inverted, passthrough), dim=-1)
+
+
+def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
+    if not input_dir.is_dir():
+        raise ValueError(f"Input directory does not exist: {input_dir}")
+
+    dump_dirs = []
+    worker_sets = {}
+    for candidate in sorted(input_dir.iterdir()):
+        if not candidate.is_dir():
+            continue
+        workers = sorted(
+            (
+                entry.name
+                for entry in candidate.iterdir()
+                if entry.is_dir() and WORKER_DIR_PATTERN.fullmatch(entry.name)
+            ),
+            key=lambda worker: tuple(
+                map(int, WORKER_DIR_PATTERN.fullmatch(worker).groups())
+            ),
+        )
+        if workers:
+            dump_dirs.append(candidate)
+            worker_sets[candidate] = workers
+            logger.info(
+                "Discovered dump directory %s with workers: %s", candidate, workers
+            )
+
+    if not dump_dirs:
+        raise ValueError(
+            f"No dump directories with tp_<X>_pp_<Y> workers found in {input_dir}"
+        )
+    workers = worker_sets[dump_dirs[0]]
+    for dump_dir in dump_dirs[1:]:
+        if worker_sets[dump_dir] != workers:
+            raise ValueError(
+                "Dump directories must have the same worker set. "
+                f"Expected {workers} from {dump_dirs[0]}, but found "
+                f"{worker_sets[dump_dir]} in {dump_dir}."
+            )
+    logger.info(
+        "Using %d dump directories and %d workers: %s",
+        len(dump_dirs),
+        len(workers),
+        workers,
+    )
+    return dump_dirs, workers
+
+
+def scan_dump_manifest(
+    dump_dirs: list[Path], workers: list[str]
+) -> list[DumpTensorSet]:
+    manifest = []
+    for dataset in dump_dirs:
+        for worker in workers:
+            worker_dir = dataset / worker
+            for kv in KV:
+                sequences = defaultdict(list)
+                for path in worker_dir.iterdir():
+                    if path.is_file() and kv.value in path.name:
+                        sequences[path.name.split(kv.value, 1)[0]].append(path)
+
+                for request_id, paths in sorted(sequences.items()):
+                    paths = tuple(sorted(paths))
+                    layer_zero = [
+                        path for path in paths if LAYER_ZERO_PATTERN.search(path.name)
+                    ]
+                    if not layer_zero:
+                        logger.warning(
+                            "Skipping %s/%s/%s during discovery: no layer-0 dumps",
+                            dataset,
+                            worker,
+                            request_id,
+                        )
+                        continue
+                    try:
+                        token_count = torch.concat(
+                            [
+                                torch.load(path, map_location="cpu")
+                                for path in layer_zero
+                            ]
+                        ).shape[0]
+                    except Exception as error:
+                        logger.warning(
+                            "Skipping %s/%s/%s during discovery: %s",
+                            dataset,
+                            worker,
+                            request_id,
+                            error,
+                        )
+                        continue
+                    bucket = SequenceBucket.for_length(token_count)
+                    if bucket is SequenceBucket.IGNORE:
+                        logger.info(
+                            "Ignoring too short sequence %s/%s/%s/%s: %s tokens",
+                            dataset,
+                            worker,
+                            request_id,
+                            kv.name,
+                            token_count,
+                        )
+                        continue
+                    manifest.append(
+                        DumpTensorSet(
+                            dataset=dataset,
+                            request_id=request_id,
+                            worker=worker,
+                            kv=kv,
+                            paths=paths,
+                            token_count=token_count,
+                            bucket=bucket,
+                        )
+                    )
+    logger.info("Indexed %d eligible worker/KV request entries", len(manifest))
+    return manifest
+
+
+def partition_requests(
+    manifest: list[DumpTensorSet],
+    canonical_worker: str,
+    dp_sample_tokens: int,
+    seed: int,
+) -> set[tuple[Path, str]]:
+    grouped = defaultdict(list)
+    for tensor_set in manifest:
+        if tensor_set.worker == canonical_worker and tensor_set.kv is KV.K:
+            grouped[(tensor_set.dataset, tensor_set.bucket)].append(tensor_set)
+    if not grouped:
+        raise ValueError("No eligible requests are available for the DP holdout")
+
+    target_per_group = math.ceil(dp_sample_tokens / len(grouped))
+    reserved = set()
+    for group_index, ((dataset, bucket), candidates) in enumerate(
+        sorted(grouped.items(), key=lambda item: (str(item[0][0]), int(item[0][1])))
+    ):
+        candidates.sort(key=lambda item: item.request_id)
+        random.Random(seed + group_index).shuffle(candidates)
+        capacity = 0
+        selected = 0
+        for tensor_set in candidates:
+            reserved.add((dataset, tensor_set.request_id))
+            capacity += tensor_set.usable_tokens
+            selected += 1
+            if capacity >= target_per_group:
+                break
+        if capacity < target_per_group:
+            logger.error(
+                "DP holdout group %s/%s has only %s usable tokens; %s are required",
+                dataset,
+                bucket.name.lower(),
+                capacity,
+                target_per_group,
+            )
+        logger.info(
+            "Reserved %s requests with %s usable tokens for DP in %s/%s",
+            selected,
+            capacity,
+            dataset,
+            bucket.name.lower(),
+        )
+    return reserved
+
+
+def select_records(
+    manifest: list[DumpTensorSet],
+    worker: str,
+    kv: KV,
+    dp_request_ids: set[tuple[Path, str]],
+    partition: str,
+) -> list[DumpTensorSet]:
+    select_dp = partition == "dp"
+    return [
+        tensor_set
+        for tensor_set in manifest
+        if tensor_set.worker == worker
+        and tensor_set.kv is kv
+        and (
+            ((tensor_set.dataset, tensor_set.request_id) in dp_request_ids) == select_dp
+        )
+    ]
+
+
+def allocate_samples(
+    records: list[DumpTensorSet], target: int, policy: SamplingPolicy
+) -> list[SampleAllocation]:
+    if not records:
+        return []
+    dataset_count = len({record.dataset for record in records})
+    strict_groups = len({(record.dataset, record.bucket) for record in records})
+    dataset_records = Counter(record.dataset for record in records)
+    strict_records = Counter((record.dataset, record.bucket) for record in records)
+
+    allocations = []
+    for record in records:
+        if policy is SamplingPolicy.STRICT:
+            count = math.ceil(
+                target / strict_groups / strict_records[(record.dataset, record.bucket)]
+            )
+        elif policy is SamplingPolicy.RELAXED:
+            count = math.ceil(target / dataset_count / dataset_records[record.dataset])
+        else:
+            count = math.ceil(target / len(records))
+        allocations.append(SampleAllocation(record, count))
+    return allocations
+
+
+def load_tensor(paths: tuple[Path, ...]) -> tuple[torch.Tensor | None, int | None]:
+    """Load one request only when every chunk has the same complete layer set."""
+    if not paths:
+        logger.warning("Discarding empty dump request")
+        return None, None
+    request_path = paths[0].parent
+    request_name = paths[0].name.split("-K-", 1)[0].split("-V-", 1)[0]
+    chunks = defaultdict(dict)
+    for path in paths:
+        match = re.search(r"chunk_(\d+)-layer_(\d+)\.bin$", path.name)
+        if match is None:
+            logger.warning(
+                "Discarding %s: unrecognized dump filename %s", request_name, path
+            )
+            return None, None
+        chunk_id, layer_id = map(int, match.groups())
+        if layer_id in chunks[chunk_id]:
+            logger.warning(
+                "Discarding %s: duplicate layer %s in chunk %s at %s",
+                request_name,
+                layer_id,
+                chunk_id,
+                request_path,
+            )
+            return None, None
+        chunks[chunk_id][layer_id] = path
+
+    chunk_ids = sorted(chunks)
+    if chunk_ids != list(range(len(chunk_ids))):
+        logger.warning(
+            "Discarding %s: non-contiguous chunk IDs %s at %s",
+            request_name,
+            chunk_ids,
+            request_path,
+        )
+        return None, None
+
+    expected_layer_ids = None
+    chunk_tensors = []
+    for chunk_id in chunk_ids:
+        layer_ids = sorted(chunks[chunk_id])
+        if expected_layer_ids is None:
+            expected_layer_ids = layer_ids
+        elif layer_ids != expected_layer_ids:
+            logger.warning(
+                "Discarding %s: chunk %s has layers %s, expected %s at %s",
+                request_name,
+                chunk_id,
+                layer_ids,
+                expected_layer_ids,
+                request_path,
+            )
+            return None, None
+        try:
+            layer_tensors = [
+                torch.load(chunks[chunk_id][layer_id], map_location="cpu")
+                for layer_id in layer_ids
+            ]
+            chunk = torch.stack(layer_tensors)
+        except Exception as error:
+            logger.warning(
+                "Discarding %s: cannot load chunk %s at %s: %s",
+                request_name,
+                chunk_id,
+                request_path,
+                error,
+            )
+            return None, None
+        if chunk.ndim != 4:
+            logger.warning(
+                "Discarding %s: chunk %s has shape %s, expected "
+                "[layer, token, head, head_dim]",
+                request_name,
+                chunk_id,
+                tuple(chunk.shape),
+            )
+            return None, None
+        if chunk_tensors and (
+            chunk.shape[0] != chunk_tensors[0].shape[0]
+            or chunk.shape[2:] != chunk_tensors[0].shape[2:]
+            or chunk.dtype != chunk_tensors[0].dtype
+        ):
+            logger.warning(
+                "Discarding %s: chunk %s shape/dtype %s/%s differs from %s/%s",
+                request_name,
+                chunk_id,
+                tuple(chunk.shape),
+                chunk.dtype,
+                tuple(chunk_tensors[0].shape),
+                chunk_tensors[0].dtype,
+            )
+            return None, None
+        chunk_tensors.append(chunk)
+
+    try:
+        tensor = torch.concat(chunk_tensors, dim=1).transpose(0, 1)
+    except RuntimeError as error:
+        logger.warning(
+            "Discarding %s: cannot combine validated chunks at %s: %s",
+            request_name,
+            request_path,
+            error,
+        )
+        return None, None
+    if tensor.dtype != torch.bfloat16:
+        logger.warning(
+            "Discarding %s: dtype %s, expected torch.bfloat16",
+            request_name,
+            tensor.dtype,
+        )
+        return None, None
+    logger.info("Loaded %s from %s", tuple(tensor.shape), request_name)
+    torch.cpu.synchronize()
+    return tensor, tensor.shape[0]
+
+
+def _combine_samples(tensors: list[torch.Tensor]) -> torch.Tensor:
+    if not tensors:
+        raise ValueError("No valid calibration tensors were loaded")
+    feature_shapes = Counter(tensor.shape[1:] for tensor in tensors)
+    feature_shape, _ = feature_shapes.most_common(1)[0]
+    valid = [tensor for tensor in tensors if tensor.shape[1:] == feature_shape]
+    if len(valid) != len(tensors):
+        logger.warning(
+            "Discarding %s sampled tensors with non-canonical feature shapes; "
+            "using %s from %s tensors",
+            len(tensors) - len(valid),
+            feature_shape,
+            len(valid),
+        )
+        logger.warning("Observed sampled feature shapes: %s", dict(feature_shapes))
+    result = torch.concat(valid, dim=0).flatten(start_dim=1)
+    torch.cpu.synchronize()
+    return result
+
+
+def load_samples(
+    allocations: list[SampleAllocation],
+    target: int,
+    undo_rope: bool,
+    seed: int,
+    purpose: str,
+) -> torch.Tensor:
+    rng = random.Random(seed)
+    samples = []
+    collected = Counter()
+    kv = allocations[0].tensor_set.kv if allocations else "KV"
+    for allocation in allocations:
+        record = allocation.tensor_set
+        tensor, token_count = load_tensor(record.paths)
+        if tensor is None or token_count is None:
+            continue
+        try:
+            if allocation.token_count > token_count - SINK_TOKENS:
+                raise ValueError(
+                    f"sampling budget {allocation.token_count} exceeds the non-sink "
+                    f"tokens in {token_count}-token request"
+                )
+            if undo_rope:
+                tensor = Rope.invert(tensor)
+            tensor = tensor[128:-128]
+            indices = sorted(rng.sample(range(tensor.shape[0]), allocation.token_count))
+            samples.append(tensor[indices].to(dtype=torch.float32, copy=True))
+            collected[(record.dataset, record.bucket)] += allocation.token_count
+        except (AssertionError, RuntimeError, ValueError) as error:
+            logger.warning("Skipping %s: %s", record.paths[0], error)
+
+    if not samples:
+        raise RuntimeError(f"No valid {kv} dump requests remain for {purpose}")
+    data = _combine_samples(samples)
+    if data.shape[0] < target:
+        raise RuntimeError(
+            f"Collected only {data.shape[0]}/{target} {kv} tokens for {purpose}"
+        )
+    data = data[:target]
+    for (dataset, bucket), count in sorted(
+        collected.items(), key=lambda item: (str(item[0][0]), int(item[0][1]))
+    ):
+        logger.info(
+            "%s %s/%s sampled tokens from %s/%s",
+            purpose,
+            count,
+            target,
+            dataset,
+            bucket.name.lower(),
+        )
+    logger.info("Collected %s/%s %s tokens for %s", data.shape[0], target, kv, purpose)
+    return data
+
+
+def fit_pca(
+    samples: torch.Tensor, svd_dim: int, svd_iter: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logger.info("PCA input shape=%s dtype=%s", tuple(samples.shape), samples.dtype)
+    mean = samples.mean(dim=0)
+    logger.info("Calculating low-rank SVD q=%s iter=%s", svd_dim, svd_iter)
+    _, _, basis = torch.svd_lowrank(samples, q=svd_dim, niter=svd_iter, M=mean)
+    return mean, basis
