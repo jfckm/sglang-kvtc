@@ -316,7 +316,7 @@ class _AscendKvtcTestCaseBase:
                     "--niter",
                     str(cls.kvtc_calibration_params["niter"]),
                     "--compression-ratios",
-                    " ".join(cls.kvtc_calibration_params["compression_ratios"]),
+                    *[str(cr) for cr in cls.kvtc_calibration_params["compression_ratios"]],
                 ],
                 check=True,
                 capture_output=True,
