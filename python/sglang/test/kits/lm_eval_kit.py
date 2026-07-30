@@ -109,6 +109,9 @@ class LMEvalMixin:
                 model=backend,
                 model_args=model_args,
                 tasks=[task["name"] for task in eval_config["tasks"]],
+                task_manager=lm_eval.tasks.TaskManager(metadata=eval_config["metadata"])
+                if eval_config.get("metadata")
+                else None,
                 num_fewshot=eval_config.get("num_fewshot", 0),
                 limit=eval_config.get("limit", None),
                 apply_chat_template=eval_config.get("apply_chat_template", False),
