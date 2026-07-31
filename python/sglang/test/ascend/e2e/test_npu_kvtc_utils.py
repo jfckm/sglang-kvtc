@@ -317,6 +317,10 @@ class _AscendKvtcTestCaseBase:
                     str(cls.kvtc_calibration_params["niter"]),
                     "--compression-ratios",
                     *[str(cr) for cr in cls.kvtc_calibration_params["compression_ratios"]],
+                    "--quant-device",
+                    "npu",
+                    "--quant-npu-workspace-mb",
+                    "1000"
                 ],
                 check=True,
                 capture_output=True,
