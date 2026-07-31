@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 LAYER_ZERO_PATTERN = re.compile(r"chunk_\d+-layer_0\.bin$")
-SINK_TOKENS = 256
+SINK_TOKENS = 4
+SLIDING_WINDOW_TOKENS = 128
 
 
 class SamplingPolicy(Enum):
@@ -59,7 +60,7 @@ class DumpTensorSet:
 
     @property
     def usable_tokens(self) -> int:
-        return self.token_count - SINK_TOKENS
+        return self.token_count - SINK_TOKENS - SLIDING_WINDOW_TOKENS
 
 
 @dataclass(frozen=True)
@@ -268,7 +269,7 @@ def scan_dump_manifest(
                         continue
                     bucket = SequenceBucket.for_length(token_count)
                     if bucket is SequenceBucket.IGNORE:
-                        logger.info(
+                        logger.debug(
                             "Ignoring too short sequence %s/%s/%s/%s: %s tokens",
                             dataset,
                             worker,
@@ -534,14 +535,14 @@ def load_samples(
         if tensor is None or token_count is None:
             continue
         try:
-            if allocation.token_count > token_count - SINK_TOKENS:
+            if allocation.token_count > token_count - SINK_TOKENS - SLIDING_WINDOW_TOKENS:
                 raise ValueError(
                     f"sampling budget {allocation.token_count} exceeds the non-sink "
                     f"tokens in {token_count}-token request"
                 )
             if undo_rope:
                 tensor = Rope.invert(tensor)
-            tensor = tensor[128:-128]
+            tensor = tensor[SINK_TOKENS:-SLIDING_WINDOW_TOKENS]
             indices = sorted(rng.sample(range(tensor.shape[0]), allocation.token_count))
             samples.append(tensor[indices].to(dtype=torch.float32, copy=True))
             collected[(record.dataset, record.bucket)] += allocation.token_count

@@ -169,19 +169,12 @@ def run() -> None:
     Rope.load_model_config(args.model_dir)
     init_logger(
         log_dir,
-        (
-            f"dp-reuse_{timestamp}.log"
-            if args.reuse_pca is not None
-            else f"svd-q{args.svd_dim}_iter{args.niter}_{timestamp}.log"
-        ),
+        f"KVTC_q{args.svd_dim}_iter{args.niter}_{timestamp}.log",
         args.log_level,
     )
 
     dump_dirs, workers = discover_dump_directories(input_dir)
     manifest = scan_dump_manifest(dump_dirs, workers)
-    dp_request_ids = partition_requests(
-        manifest, workers[0], args.dp_sample_tokens, args.seed
-    )
     output = (
         load_pca_artifact(args.reuse_pca, workers)
         if args.reuse_pca is not None
@@ -215,11 +208,8 @@ def run() -> None:
                     basis.shape,
                 )
             else:
-                pca_records = select_records(
-                    manifest, worker, kv, dp_request_ids, "pca"
-                )
                 pca_allocations = allocate_samples(
-                    pca_records, args.sample_tokens, sampling_policy
+                    manifest, args.sample_tokens, sampling_policy
                 )
                 pca_samples = load_samples(
                     pca_allocations,
@@ -236,9 +226,8 @@ def run() -> None:
                     "quant": {},
                 }
 
-            dp_records = select_records(manifest, worker, kv, dp_request_ids, "dp")
             dp_allocations = allocate_samples(
-                dp_records, args.dp_sample_tokens, sampling_policy
+                manifest, args.dp_sample_tokens, sampling_policy
             )
             dp_samples = load_samples(
                 dp_allocations,
