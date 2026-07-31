@@ -462,7 +462,7 @@ class TestAscendPerformanceKvtcTestCaseLME(
     backend = "local-completions"
     metadata = {}
     num_fewshot = 0
-    limit = None
+    benchmark_size_limit = None
     apply_chat_template = False
     fewshot_as_multiturn = False
     gen_kwargs = None
@@ -490,7 +490,7 @@ class TestAscendPerformanceKvtcTestCaseLME(
                 tasks=[task["name"] for task in self.task_list],
                 task_manager=lm_eval.tasks.TaskManager(metadata=self.metadata),
                 num_fewshot=self.num_fewshot,
-                limit=self.limit,
+                limit=self.benchmark_size_limit,
                 apply_chat_template=self.apply_chat_template,
                 fewshot_as_multiturn=self.fewshot_as_multiturn,
                 gen_kwargs=self.gen_kwargs,
@@ -521,7 +521,7 @@ class TestAscendPerformanceKvtcTestCaseLME(
                 datasets=datasets,
                 dataset_args=dataset_args,
                 eval_batch_size=self.batch_size,
-                limit=self.limit,
+                limit=self.benchmark_size_limit,
                 generation_config=generation_config,
                 dataset_dir=dataset_dir,
                 stream=stream,
