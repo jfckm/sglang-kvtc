@@ -18,7 +18,6 @@ QUANT_DTYPES = ("float32", "bfloat16", "int8", "int4")
 QUANT_BLOCK_SIZES = (1, 16, 64, 256, 1024)
 INT4_BLOCK_SIZES = (8, 16, 64, 256, 1024)
 NPU_ERROR_BYTES_PER_VALUE = 16
-NPU_ERROR_BATCHES_PER_SYNC = 4
 
 
 def resolve_quant_device(device_name: str) -> torch.device:
@@ -206,30 +205,19 @@ def _build_npu_integer_errors(
                 window_count,
                 batch_size,
             )
-            pending_keys = []
-            pending_errors = []
-
-            def flush_errors() -> None:
-                if not pending_errors:
-                    return
-                values = torch.cat(pending_errors).cpu().tolist()
-                errors.update(zip(pending_keys, values))
-                progress.update(len(pending_keys))
-                pending_keys.clear()
-                pending_errors.clear()
-
             for first in range(0, window_count, batch_size):
                 starts = list(range(first, min(first + batch_size, window_count)))
                 source = torch.stack(
                     [projected_data[:, start : start + size] for start in starts]
                 )
-                pending_keys.extend(
-                    (start, size, dtype_name) for start in starts
+                batch_errors = _npu_integer_batch_errors(source, dtype_name)
+                values = batch_errors.cpu().tolist()
+                errors.update(
+                    ((start, size, dtype_name), error)
+                    for start, error in zip(starts, values)
                 )
-                pending_errors.append(_npu_integer_batch_errors(source, dtype_name))
-                if len(pending_errors) == NPU_ERROR_BATCHES_PER_SYNC:
-                    flush_errors()
-            flush_errors()
+                progress.update(len(starts))
+                del source, batch_errors
     return errors
 
 
