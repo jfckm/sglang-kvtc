@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 from sglang.srt.mem_cache.kvtc_quant import build_quant_layout, quant_group_bits
 
@@ -36,7 +37,8 @@ def simulate_quantization_error(values: torch.Tensor, dtype_name: str) -> float:
         quantized = torch.clamp(torch.round(values / scale + zero_point), qmin, qmax)
         reconstructed = (quantized - zero_point) * scale
         reconstructed = torch.where(value_range > 0, reconstructed, values)
-    return float((values - reconstructed).square().sum().item())
+    error_norm = torch.linalg.vector_norm(values - reconstructed)
+    return float(error_norm.square().item())
 
 
 @dataclass(frozen=True)
@@ -84,36 +86,44 @@ def assign_quantization(
             )
         return error_cache[key]
 
-    for end in range(1, rank + 1):
-        for dtype_index, dtype_name in enumerate(QUANT_DTYPES):
-            block_sizes = (
-                INT4_BLOCK_SIZES if dtype_name == "int4" else QUANT_BLOCK_SIZES
-            )
-            candidates = []
-            for size in block_sizes:
-                start = end - size
-                group_cost = quant_group_bits(size, dtype_name)
-                if start < 0 or group_cost > budget:
-                    continue
-                quant_error = block_error(start, size, dtype_name)
-                if start == 0:
-                    candidates.append(
-                        DPRecord(quant_error, group_cost, None, (size, dtype_name))
-                    )
-                    continue
-                for previous_dtype in range(dtype_index + 1):
-                    for previous in frontiers[start][previous_dtype].values():
-                        cost = previous.cost + group_cost
-                        if cost <= budget:
-                            candidates.append(
-                                DPRecord(
-                                    previous.error + quant_error,
-                                    cost,
-                                    previous,
-                                    (size, dtype_name),
+    with tqdm(
+        total=rank * len(QUANT_DTYPES),
+        desc=f"DP {compression_ratio}x",
+        unit="state",
+        dynamic_ncols=True,
+        disable=None,
+    ) as progress:
+        for end in range(1, rank + 1):
+            for dtype_index, dtype_name in enumerate(QUANT_DTYPES):
+                block_sizes = (
+                    INT4_BLOCK_SIZES if dtype_name == "int4" else QUANT_BLOCK_SIZES
+                )
+                candidates = []
+                for size in block_sizes:
+                    start = end - size
+                    group_cost = quant_group_bits(size, dtype_name)
+                    if start < 0 or group_cost > budget:
+                        continue
+                    quant_error = block_error(start, size, dtype_name)
+                    if start == 0:
+                        candidates.append(
+                            DPRecord(quant_error, group_cost, None, (size, dtype_name))
+                        )
+                        continue
+                    for previous_dtype in range(dtype_index + 1):
+                        for previous in frontiers[start][previous_dtype].values():
+                            cost = previous.cost + group_cost
+                            if cost <= budget:
+                                candidates.append(
+                                    DPRecord(
+                                        previous.error + quant_error,
+                                        cost,
+                                        previous,
+                                        (size, dtype_name),
+                                    )
                                 )
-                            )
-            frontiers[end][dtype_index] = _pareto_frontier(candidates)
+                frontiers[end][dtype_index] = _pareto_frontier(candidates)
+                progress.update()
 
     feature_energy = projected_data.to(torch.float64).square().sum(dim=0)
     tail_error = torch.cat(
@@ -139,6 +149,9 @@ def assign_quantization(
             "which cannot fit a non-empty quantization schema"
         )
 
+    source_norm = float(torch.linalg.vector_norm(projected_data).item())
+    relative_error = math.sqrt(best_total_error) / source_norm if source_norm else 0.0
+
     schema = []
     while best is not None:
         schema.append(best.group)
@@ -156,11 +169,11 @@ def assign_quantization(
             merged.append((size, dtype_name))
     build_quant_layout(merged, page_size=1, basis_rank=rank, matrix_name="calibrated")
     logger.info(
-        "DP ratio=%sx budget=%s bits used=%s error=%s schema=%s",
+        "DP ratio=%sx budget=%s bits used=%s relative_error=%s schema=%s",
         compression_ratio,
         budget,
         sum(quant_group_bits(size, dtype_name) for size, dtype_name in merged),
-        best_total_error,
+        relative_error,
         merged,
     )
     return merged
