@@ -160,11 +160,15 @@ def run() -> None:
     validate_args(parser, args)
 
     input_dir = Path(args.input_dir)
+
     output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     log_dir = Path(args.log_dir)
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+
     compression_ratios = list(dict.fromkeys(args.compression_ratios))
     sampling_policy = SamplingPolicy(args.sampling_policy)
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
 
     Rope.load_model_config(args.model_dir)
     init_logger(
@@ -181,7 +185,7 @@ def run() -> None:
         else empty_output(workers)
     )
     logger.info(
-        "model=%s PCA=%s DP_N=%s ratios=%s manifest_entries=%s",
+        "model=%s PCA={%s} DP_N=%s ratios=%s manifest_entries=%s",
         args.model_dir,
         (
             args.reuse_pca
@@ -195,6 +199,8 @@ def run() -> None:
 
     for worker_index, worker in enumerate(workers):
         for kv_index, kv in enumerate(KV):
+            logger.info(f"Calibrating {worker} - {kv}")
+
             matrix_name = kv.matrix_name
             sample_seed = args.seed + worker_index * 4 + kv_index * 2
             if args.reuse_pca is not None:

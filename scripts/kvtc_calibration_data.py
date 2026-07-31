@@ -493,7 +493,7 @@ def load_tensor(paths: tuple[Path, ...]) -> tuple[torch.Tensor | None, int | Non
             tensor.dtype,
         )
         return None, None
-    logger.info("Loaded %s from %s", tuple(tensor.shape), request_name)
+    logger.debug("Loaded %s from %s", tuple(tensor.shape), request_name)
     torch.cpu.synchronize()
     return tensor, tensor.shape[0]
 
