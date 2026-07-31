@@ -17,13 +17,11 @@ from scripts.kvtc_calibration_data import (  # noqa: E402
     KV,
     Rope,
     SamplingPolicy,
-    allocate_samples,
     discover_dump_directories,
     fit_pca,
-    load_samples,
-    partition_requests,
+    load_sample_pool,
+    sample_pool,
     scan_dump_manifest,
-    select_records,
 )
 from scripts.kvtc_calibration_quant import (  # noqa: E402
     KVTC_FILE_VERSION,
@@ -203,6 +201,13 @@ def run() -> None:
 
             matrix_name = kv.matrix_name
             sample_seed = args.seed + worker_index * 4 + kv_index * 2
+            records = [
+                tensor_set
+                for tensor_set in manifest
+                if tensor_set.worker == worker and tensor_set.kv is kv
+            ]
+            sample_pool_data = load_sample_pool(records, kv is KV.K)
+
             if args.reuse_pca is not None:
                 mean = output[matrix_name][worker]["mu"]
                 basis = output[matrix_name][worker]["basis"]
@@ -213,17 +218,26 @@ def run() -> None:
                     mean.shape,
                     basis.shape,
                 )
+                pca_samples = None
             else:
-                pca_allocations = allocate_samples(
-                    manifest, args.sample_tokens, sampling_policy
-                )
-                pca_samples = load_samples(
-                    pca_allocations,
+                pca_samples = sample_pool(
+                    sample_pool_data,
                     args.sample_tokens,
-                    kv is KV.K,
+                    sampling_policy,
                     sample_seed,
                     "PCA",
                 )
+
+            dp_samples = sample_pool(
+                sample_pool_data,
+                args.dp_sample_tokens,
+                sampling_policy,
+                sample_seed + 1,
+                "DP quantization",
+            )
+            del sample_pool_data
+
+            if pca_samples is not None:
                 mean, basis = fit_pca(pca_samples, args.svd_dim, args.niter)
                 del pca_samples
                 output[matrix_name][worker] = {
@@ -232,16 +246,6 @@ def run() -> None:
                     "quant": {},
                 }
 
-            dp_allocations = allocate_samples(
-                manifest, args.dp_sample_tokens, sampling_policy
-            )
-            dp_samples = load_samples(
-                dp_allocations,
-                args.dp_sample_tokens,
-                kv is KV.K,
-                sample_seed + 1,
-                "DP quantization",
-            )
             projected_dp = (dp_samples - mean) @ basis
             feature_count = dp_samples.shape[1]
             for compression_ratio in compression_ratios:

@@ -69,6 +69,12 @@ class SampleAllocation:
     token_count: int
 
 
+@dataclass(frozen=True)
+class LoadedTensorSet:
+    tensor_set: DumpTensorSet
+    tensor: torch.Tensor
+
+
 class Rope:
     rotary_emb = None
     rotary_dim = None
@@ -498,60 +504,83 @@ def load_tensor(paths: tuple[Path, ...]) -> tuple[torch.Tensor | None, int | Non
     return tensor, tensor.shape[0]
 
 
-def _combine_samples(tensors: list[torch.Tensor]) -> torch.Tensor:
-    if not tensors:
-        raise ValueError("No valid calibration tensors were loaded")
-    feature_shapes = Counter(tensor.shape[1:] for tensor in tensors)
-    feature_shape, _ = feature_shapes.most_common(1)[0]
-    valid = [tensor for tensor in tensors if tensor.shape[1:] == feature_shape]
-    if len(valid) != len(tensors):
-        logger.warning(
-            "Discarding %s sampled tensors with non-canonical feature shapes; "
-            "using %s from %s tensors",
-            len(tensors) - len(valid),
-            feature_shape,
-            len(valid),
-        )
-        logger.warning("Observed sampled feature shapes: %s", dict(feature_shapes))
-    result = torch.concat(valid, dim=0).flatten(start_dim=1)
-    torch.cpu.synchronize()
-    return result
-
-
-def load_samples(
-    allocations: list[SampleAllocation],
-    target: int,
+def load_sample_pool(
+    records: list[DumpTensorSet],
     undo_rope: bool,
-    seed: int,
-    purpose: str,
-) -> torch.Tensor:
-    rng = random.Random(seed)
-    samples = []
-    collected = Counter()
-    kv = allocations[0].tensor_set.kv if allocations else "KV"
-    for allocation in allocations:
-        record = allocation.tensor_set
+) -> list[LoadedTensorSet]:
+    loaded = []
+    for record in records:
         tensor, token_count = load_tensor(record.paths)
         if tensor is None or token_count is None:
             continue
         try:
-            if allocation.token_count > token_count - SINK_TOKENS - SLIDING_WINDOW_TOKENS:
-                raise ValueError(
-                    f"sampling budget {allocation.token_count} exceeds the non-sink "
-                    f"tokens in {token_count}-token request"
-                )
             if undo_rope:
                 tensor = Rope.invert(tensor)
             tensor = tensor[SINK_TOKENS:-SLIDING_WINDOW_TOKENS]
+            loaded.append(LoadedTensorSet(record, tensor))
+        except (AssertionError, RuntimeError, ValueError) as error:
+            logger.warning("Skipping %s: %s", record.paths[0], error)
+
+    if not loaded:
+        raise RuntimeError("No valid dump requests remain in the sampling pool")
+
+    feature_shapes = Counter(entry.tensor.shape[1:] for entry in loaded)
+    feature_shape, _ = feature_shapes.most_common(1)[0]
+    valid = [entry for entry in loaded if entry.tensor.shape[1:] == feature_shape]
+    if len(valid) != len(loaded):
+        logger.warning(
+            "Discarding %s loaded tensors with non-canonical feature shapes; "
+            "using %s from %s tensors",
+            len(loaded) - len(valid),
+            feature_shape,
+            len(valid),
+        )
+        logger.warning("Observed loaded feature shapes: %s", dict(feature_shapes))
+
+    logger.info(
+        "Loaded %s valid requests with %s usable tokens into the sampling pool",
+        len(valid),
+        sum(entry.tensor.shape[0] for entry in valid),
+    )
+    return valid
+
+
+def sample_pool(
+    pool: list[LoadedTensorSet],
+    target: int,
+    policy: SamplingPolicy,
+    seed: int,
+    purpose: str,
+) -> torch.Tensor:
+    allocations = allocate_samples(
+        [entry.tensor_set for entry in pool],
+        target,
+        policy,
+    )
+    tensors = {entry.tensor_set: entry.tensor for entry in pool}
+    rng = random.Random(seed)
+    samples = []
+    collected = Counter()
+    kv = pool[0].tensor_set.kv if pool else "KV"
+    for allocation in allocations:
+        record = allocation.tensor_set
+        tensor = tensors[record]
+        try:
+            if allocation.token_count > tensor.shape[0]:
+                raise ValueError(
+                    f"sampling budget {allocation.token_count} exceeds the "
+                    f"{tensor.shape[0]} usable tokens in the request"
+                )
             indices = sorted(rng.sample(range(tensor.shape[0]), allocation.token_count))
             samples.append(tensor[indices].to(dtype=torch.float32, copy=True))
             collected[(record.dataset, record.bucket)] += allocation.token_count
-        except (AssertionError, RuntimeError, ValueError) as error:
+        except (RuntimeError, ValueError) as error:
             logger.warning("Skipping %s: %s", record.paths[0], error)
 
     if not samples:
         raise RuntimeError(f"No valid {kv} dump requests remain for {purpose}")
-    data = _combine_samples(samples)
+    data = torch.concat(samples, dim=0).flatten(start_dim=1)
+    torch.cpu.synchronize()
     if data.shape[0] < target:
         raise RuntimeError(
             f"Collected only {data.shape[0]}/{target} {kv} tokens for {purpose}"
