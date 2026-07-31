@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -25,8 +26,9 @@ from scripts.kvtc_calibration_data import (  # noqa: E402
 )
 from scripts.kvtc_calibration_quant import (  # noqa: E402
     KVTC_FILE_VERSION,
-    assign_quantization,
+    assign_quantizations,
     load_pca_artifact,
+    resolve_quant_device,
 )
 
 logger = logging.getLogger()
@@ -89,6 +91,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Positive integer compression ratios for which quantization schemas are generated",
     )
     parser.add_argument(
+        "--quant-device",
+        choices=("cpu", "npu"),
+        default="cpu",
+        help="Device used for DP projection and quantization errors (default=cpu)",
+    )
+    parser.add_argument(
+        "--quant-npu-workspace-mb",
+        type=int,
+        default=512,
+        help="Target NPU workspace for batched quantization errors (default=512)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -138,6 +152,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("DP sample token count must be positive")
     if any(ratio <= 0 for ratio in args.compression_ratios):
         parser.error("Compression ratios must be positive integers")
+    if args.quant_npu_workspace_mb <= 0:
+        parser.error("NPU quantization workspace must be positive")
 
 
 def empty_output(workers: list[str]) -> dict:
@@ -167,6 +183,7 @@ def run() -> None:
 
     compression_ratios = list(dict.fromkeys(args.compression_ratios))
     sampling_policy = SamplingPolicy(args.sampling_policy)
+    quant_device = resolve_quant_device(args.quant_device)
 
     Rope.load_model_config(args.model_dir)
     init_logger(
@@ -183,7 +200,7 @@ def run() -> None:
         else empty_output(workers)
     )
     logger.info(
-        "model=%s PCA={%s} DP_N=%s ratios=%s manifest_entries=%s",
+        "model=%s PCA={%s} DP_N=%s ratios=%s quant_device=%s manifest_entries=%s",
         args.model_dir,
         (
             args.reuse_pca
@@ -192,6 +209,7 @@ def run() -> None:
         ),
         args.dp_sample_tokens,
         compression_ratios,
+        quant_device,
         len(manifest),
     )
 
@@ -246,17 +264,35 @@ def run() -> None:
                     "quant": {},
                 }
 
-            projected_dp = (dp_samples - mean) @ basis
             feature_count = dp_samples.shape[1]
-            for compression_ratio in compression_ratios:
-                output[matrix_name][worker]["quant"][str(compression_ratio)] = (
-                    assign_quantization(
-                        projected_dp,
-                        feature_count,
-                        compression_ratio,
-                    )
-                )
-            del dp_samples, projected_dp
+            projection_started = time.perf_counter()
+            if quant_device.type == "npu":
+                device_samples = dp_samples.to(quant_device)
+                device_mean = mean.to(quant_device)
+                device_basis = basis.to(quant_device)
+                projected_dp = (device_samples - device_mean) @ device_basis
+                torch.npu.synchronize()
+                del device_samples, device_mean, device_basis
+            else:
+                projected_dp = (dp_samples - mean) @ basis
+            del dp_samples
+            logger.info(
+                "Projected DP samples on %s in %.2fs",
+                quant_device.type,
+                time.perf_counter() - projection_started,
+            )
+
+            schemas = assign_quantizations(
+                projected_dp,
+                feature_count,
+                compression_ratios,
+                args.quant_npu_workspace_mb,
+            )
+            for compression_ratio, schema in schemas.items():
+                output[matrix_name][worker]["quant"][str(compression_ratio)] = schema
+            del projected_dp
+            if quant_device.type == "npu":
+                torch.npu.empty_cache()
     torch.save(output, output_path)
 
 

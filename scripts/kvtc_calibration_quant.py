@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,36 @@ KVTC_FILE_VERSION = "v3-worker-quant"
 QUANT_DTYPES = ("float32", "bfloat16", "int8", "int4")
 QUANT_BLOCK_SIZES = (1, 16, 64, 256, 1024)
 INT4_BLOCK_SIZES = (8, 16, 64, 256, 1024)
+NPU_ERROR_BYTES_PER_VALUE = 16
+NPU_ERROR_BATCHES_PER_SYNC = 4
+
+
+def resolve_quant_device(device_name: str) -> torch.device:
+    if device_name == "cpu":
+        return torch.device("cpu")
+    if device_name != "npu":
+        raise ValueError(f"Unsupported quantization device: {device_name}")
+
+    try:
+        import torch_npu
+    except ImportError as error:
+        raise RuntimeError(
+            "NPU quantization requested, but torch_npu is not installed"
+        ) from error
+
+    missing_ops = [
+        name
+        for name in ("npu_dynamic_quant_asymmetric", "npu_anti_quant")
+        if not hasattr(torch_npu, name)
+    ]
+    if missing_ops:
+        raise RuntimeError(
+            "NPU quantization requires missing torch_npu APIs: "
+            + ", ".join(missing_ops)
+        )
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        raise RuntimeError("NPU quantization requested, but no NPU is available")
+    return torch.device("npu")
 
 
 def simulate_quantization_error(values: torch.Tensor, dtype_name: str) -> float:
@@ -24,21 +55,253 @@ def simulate_quantization_error(values: torch.Tensor, dtype_name: str) -> float:
     if dtype_name == "bfloat16":
         reconstructed = values.to(torch.bfloat16).to(torch.float32)
     else:
-        qmin, qmax = (-128, 127) if dtype_name == "int8" else (0, 15)
-        minimum = values.amin(dim=1, keepdim=True)
-        maximum = values.amax(dim=1, keepdim=True)
+        qmin, qmax = (-128, 127) if dtype_name == "int8" else (-8, 7)
+        quant_values = values.to(torch.bfloat16).to(torch.float32)
+        minimum = quant_values.amin(dim=1, keepdim=True)
+        maximum = quant_values.amax(dim=1, keepdim=True)
         value_range = maximum - minimum
         scale = torch.where(
             value_range > 0,
             value_range / (qmax - qmin),
             torch.ones_like(value_range),
         )
-        zero_point = qmin - torch.round(minimum / scale)
-        quantized = torch.clamp(torch.round(values / scale + zero_point), qmin, qmax)
-        reconstructed = (quantized - zero_point) * scale
-        reconstructed = torch.where(value_range > 0, reconstructed, values)
+        offset = qmin - minimum / scale
+        quantized = torch.clamp(
+            torch.round(quant_values / scale + offset), qmin, qmax
+        )
+        stored_scale = scale.to(torch.float16).to(torch.float32)
+        stored_offset = offset.to(torch.float16).to(torch.float32)
+        reconstructed = (quantized - stored_offset) * stored_scale
+        reconstructed = torch.where(value_range > 0, reconstructed, quant_values)
+        reconstructed = reconstructed.to(torch.bfloat16).to(torch.float32)
     error_norm = torch.linalg.vector_norm(values - reconstructed)
     return float(error_norm.square().item())
+
+
+@dataclass(frozen=True)
+class QuantizationErrorTable:
+    rank: int
+    source_norm: float
+    tail_errors: tuple[float, ...]
+    block_errors: dict[tuple[int, int, str], float]
+
+
+def _prefix_block_errors(
+    feature_errors: torch.Tensor,
+    block_sizes: tuple[int, ...],
+    dtype_name: str,
+    max_budget: int,
+) -> dict[tuple[int, int, str], float]:
+    prefix = torch.cat(
+        (torch.zeros(1, dtype=torch.float64), feature_errors.to(torch.float64).cumsum(0))
+    )
+    errors = {}
+    rank = feature_errors.shape[0]
+    for size in block_sizes:
+        if size > rank or quant_group_bits(size, dtype_name) > max_budget:
+            continue
+        block_values = prefix[size:] - prefix[:-size]
+        for start, error in enumerate(block_values.tolist()):
+            errors[(start, size, dtype_name)] = error
+    return errors
+
+
+def _build_cpu_integer_errors(
+    projected_data: torch.Tensor,
+    max_budget: int,
+) -> dict[tuple[int, int, str], float]:
+    errors = {}
+    candidates = [
+        (dtype_name, size)
+        for dtype_name, block_sizes in (
+            ("int8", QUANT_BLOCK_SIZES),
+            ("int4", INT4_BLOCK_SIZES),
+        )
+        for size in block_sizes
+        if size <= projected_data.shape[1]
+        and quant_group_bits(size, dtype_name) <= max_budget
+    ]
+    total = sum(projected_data.shape[1] - size + 1 for _, size in candidates)
+    with tqdm(
+        total=total,
+        desc="Quantization errors (CPU)",
+        unit="block",
+        dynamic_ncols=True,
+        disable=None,
+    ) as progress:
+        for dtype_name, size in candidates:
+            for start in range(projected_data.shape[1] - size + 1):
+                errors[(start, size, dtype_name)] = simulate_quantization_error(
+                    projected_data[:, start : start + size], dtype_name
+                )
+                progress.update()
+    return errors
+
+
+def _npu_integer_batch_errors(
+    source: torch.Tensor,
+    dtype_name: str,
+) -> torch.Tensor:
+    import torch_npu
+
+    batch_count, token_count, width = source.shape
+    quant_input = source.to(torch.bfloat16).reshape(-1, width)
+    dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
+    quantized, scale, quant_offset = torch_npu.npu_dynamic_quant_asymmetric(
+        quant_input,
+        dst_type=dst_type,
+    )
+    stored_scale = scale.to(torch.float16).to(torch.float32)
+    stored_offset = (-quant_offset).to(torch.float16).to(torch.float32)
+    expanded_scale = stored_scale.reshape(-1).repeat_interleave(width)
+    expanded_offset = stored_offset.reshape(-1).repeat_interleave(width)
+    kwargs = {
+        "offset": expanded_offset,
+        "dst_dtype": torch.bfloat16,
+    }
+    if dtype_name == "int4":
+        kwargs["src_dtype"] = torch.quint4x2
+    reconstructed = torch_npu.npu_anti_quant(
+        quantized.reshape(1, -1),
+        expanded_scale,
+        **kwargs,
+    ).reshape(batch_count, token_count, width)
+    return (source - reconstructed.to(torch.float32)).square().sum(dim=(1, 2))
+
+
+def _build_npu_integer_errors(
+    projected_data: torch.Tensor,
+    max_budget: int,
+    workspace_mb: int,
+) -> dict[tuple[int, int, str], float]:
+    errors = {}
+    candidates = [
+        (dtype_name, size)
+        for dtype_name, block_sizes in (
+            ("int8", QUANT_BLOCK_SIZES),
+            ("int4", INT4_BLOCK_SIZES),
+        )
+        for size in block_sizes
+        if size <= projected_data.shape[1]
+        and quant_group_bits(size, dtype_name) <= max_budget
+    ]
+    total = sum(projected_data.shape[1] - size + 1 for _, size in candidates)
+    workspace_bytes = workspace_mb * 1024 * 1024
+    token_count = projected_data.shape[0]
+    with tqdm(
+        total=total,
+        desc="Quantization errors (NPU)",
+        unit="block",
+        dynamic_ncols=True,
+        disable=None,
+    ) as progress:
+        for dtype_name, size in candidates:
+            window_count = projected_data.shape[1] - size + 1
+            bytes_per_window = token_count * size * NPU_ERROR_BYTES_PER_VALUE
+            batch_size = max(1, workspace_bytes // bytes_per_window)
+            logger.info(
+                "NPU quantization errors dtype=%s width=%s windows=%s batch=%s",
+                dtype_name,
+                size,
+                window_count,
+                batch_size,
+            )
+            pending_keys = []
+            pending_errors = []
+
+            def flush_errors() -> None:
+                if not pending_errors:
+                    return
+                values = torch.cat(pending_errors).cpu().tolist()
+                errors.update(zip(pending_keys, values))
+                progress.update(len(pending_keys))
+                pending_keys.clear()
+                pending_errors.clear()
+
+            for first in range(0, window_count, batch_size):
+                starts = list(range(first, min(first + batch_size, window_count)))
+                source = torch.stack(
+                    [projected_data[:, start : start + size] for start in starts]
+                )
+                pending_keys.extend(
+                    (start, size, dtype_name) for start in starts
+                )
+                pending_errors.append(_npu_integer_batch_errors(source, dtype_name))
+                if len(pending_errors) == NPU_ERROR_BATCHES_PER_SYNC:
+                    flush_errors()
+            flush_errors()
+    return errors
+
+
+def build_quantization_error_table(
+    projected_data: torch.Tensor,
+    max_budget: int,
+    npu_workspace_mb: int = 512,
+) -> QuantizationErrorTable:
+    if projected_data.ndim != 2 or projected_data.shape[0] == 0:
+        raise ValueError("No held-out projections were provided for quantization")
+    if projected_data.device.type not in ("cpu", "npu"):
+        raise ValueError(
+            f"Unsupported quantization tensor device: {projected_data.device.type}"
+        )
+
+    started = time.perf_counter()
+    rank = projected_data.shape[1]
+    feature_energy = projected_data.square().sum(dim=0).cpu().to(torch.float64)
+    tail_errors_tensor = torch.cat(
+        (
+            torch.flip(
+                torch.cumsum(torch.flip(feature_energy, (0,)), dim=0), (0,)
+            ),
+            torch.zeros(1, dtype=torch.float64),
+        )
+    )
+    source_norm = math.sqrt(float(feature_energy.sum().item()))
+
+    block_errors = {}
+    for size in QUANT_BLOCK_SIZES:
+        if size <= rank and quant_group_bits(size, "float32") <= max_budget:
+            for start in range(rank - size + 1):
+                block_errors[(start, size, "float32")] = 0.0
+
+    bf16_reconstructed = projected_data.to(torch.bfloat16).to(torch.float32)
+    bf16_feature_errors = (
+        (projected_data - bf16_reconstructed).square().sum(dim=0).cpu()
+    )
+    block_errors.update(
+        _prefix_block_errors(
+            bf16_feature_errors,
+            QUANT_BLOCK_SIZES,
+            "bfloat16",
+            max_budget,
+        )
+    )
+    del bf16_reconstructed, bf16_feature_errors
+
+    if projected_data.device.type == "npu":
+        block_errors.update(
+            _build_npu_integer_errors(
+                projected_data,
+                max_budget,
+                npu_workspace_mb,
+            )
+        )
+        torch.npu.synchronize()
+    else:
+        block_errors.update(_build_cpu_integer_errors(projected_data, max_budget))
+
+    logger.info(
+        "Built %s quantization block errors on %s in %.2fs",
+        len(block_errors),
+        projected_data.device.type,
+        time.perf_counter() - started,
+    )
+    return QuantizationErrorTable(
+        rank=rank,
+        source_norm=source_norm,
+        tail_errors=tuple(tail_errors_tensor.tolist()),
+        block_errors=block_errors,
+    )
 
 
 @dataclass(frozen=True)
@@ -65,27 +328,16 @@ def _pareto_frontier(records: list[DPRecord]) -> dict[int, DPRecord]:
     return frontier
 
 
-def assign_quantization(
-    projected_data: torch.Tensor,
+def _assign_quantization(
+    error_table: QuantizationErrorTable,
     original_feature_count: int,
     compression_ratio: int,
 ) -> list[tuple[int, str]]:
-    if projected_data.ndim != 2 or projected_data.shape[0] == 0:
-        raise ValueError("No held-out projections were provided for quantization")
-    rank = projected_data.shape[1]
-
+    rank = error_table.rank
     budget = math.floor(16 * original_feature_count / compression_ratio)
     frontiers = [[{} for _ in QUANT_DTYPES] for _ in range(rank + 1)]
-    error_cache = {}
 
-    def block_error(start: int, size: int, dtype_name: str) -> float:
-        key = (start, size, dtype_name)
-        if key not in error_cache:
-            error_cache[key] = simulate_quantization_error(
-                projected_data[:, start : start + size], dtype_name
-            )
-        return error_cache[key]
-
+    started = time.perf_counter()
     with tqdm(
         total=rank * len(QUANT_DTYPES),
         desc=f"DP {compression_ratio}x",
@@ -104,7 +356,9 @@ def assign_quantization(
                     group_cost = quant_group_bits(size, dtype_name)
                     if start < 0 or group_cost > budget:
                         continue
-                    quant_error = block_error(start, size, dtype_name)
+                    quant_error = error_table.block_errors[
+                        (start, size, dtype_name)
+                    ]
                     if start == 0:
                         candidates.append(
                             DPRecord(quant_error, group_cost, None, (size, dtype_name))
@@ -125,18 +379,10 @@ def assign_quantization(
                 frontiers[end][dtype_index] = _pareto_frontier(candidates)
                 progress.update()
 
-    feature_energy = projected_data.to(torch.float64).square().sum(dim=0)
-    tail_error = torch.cat(
-        (
-            torch.flip(torch.cumsum(torch.flip(feature_energy, (0,)), dim=0), (0,)),
-            torch.zeros(1, dtype=feature_energy.dtype),
-        )
-    )
-
     best = None
     best_total_error = math.inf
     for end in range(1, rank + 1):
-        omitted_error = float(tail_error[end].item())
+        omitted_error = error_table.tail_errors[end]
         for dtype_frontier in frontiers[end]:
             for record in dtype_frontier.values():
                 total_error = record.error + omitted_error
@@ -149,8 +395,11 @@ def assign_quantization(
             "which cannot fit a non-empty quantization schema"
         )
 
-    source_norm = float(torch.linalg.vector_norm(projected_data).item())
-    relative_error = math.sqrt(best_total_error) / source_norm if source_norm else 0.0
+    relative_error = (
+        math.sqrt(best_total_error) / error_table.source_norm
+        if error_table.source_norm
+        else 0.0
+    )
 
     schema = []
     while best is not None:
@@ -169,14 +418,48 @@ def assign_quantization(
             merged.append((size, dtype_name))
     build_quant_layout(merged, page_size=1, basis_rank=rank, matrix_name="calibrated")
     logger.info(
-        "DP ratio=%sx budget=%s bits used=%s relative_error=%s schema=%s",
+        "DP ratio=%sx budget=%s bits used=%s relative_error=%s time=%.2fs schema=%s",
         compression_ratio,
         budget,
         sum(quant_group_bits(size, dtype_name) for size, dtype_name in merged),
         relative_error,
+        time.perf_counter() - started,
         merged,
     )
     return merged
+
+
+def assign_quantizations(
+    projected_data: torch.Tensor,
+    original_feature_count: int,
+    compression_ratios: list[int],
+    npu_workspace_mb: int = 512,
+) -> dict[int, list[tuple[int, str]]]:
+    max_budget = max(
+        math.floor(16 * original_feature_count / ratio)
+        for ratio in compression_ratios
+    )
+    error_table = build_quantization_error_table(
+        projected_data,
+        max_budget,
+        npu_workspace_mb,
+    )
+    return {
+        ratio: _assign_quantization(error_table, original_feature_count, ratio)
+        for ratio in compression_ratios
+    }
+
+
+def assign_quantization(
+    projected_data: torch.Tensor,
+    original_feature_count: int,
+    compression_ratio: int,
+) -> list[tuple[int, str]]:
+    return assign_quantizations(
+        projected_data,
+        original_feature_count,
+        [compression_ratio],
+    )[compression_ratio]
 
 
 def load_pca_artifact(path: Path, workers: list[str]) -> dict:
