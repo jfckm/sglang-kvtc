@@ -273,16 +273,24 @@ def run() -> None:
                 basis.shape[1], original_features // args.compression_ratio
             )
             equal_rank = min(basis.shape[1], dp_bits // 32)
+            equal_bf16_rank = min(basis.shape[1], dp_bits // 16)
             legacy_reconstructed = reconstruct_cutoff(
                 projected, mean, basis, legacy_rank
             )
             equal_reconstructed = reconstruct_cutoff(
                 projected, mean, basis, equal_rank
             )
+            equal_bf16_reconstructed = reconstruct_cutoff(
+                projected.to(torch.bfloat16).to(torch.float32),
+                mean,
+                basis,
+                equal_bf16_rank,
+            )
 
             dp_metrics = measure(source, dp_reconstructed)
             legacy_metrics = measure(source, legacy_reconstructed)
             equal_metrics = measure(source, equal_reconstructed)
+            equal_bf16_metrics = measure(source, equal_bf16_reconstructed)
             print_result(
                 worker,
                 kv,
@@ -307,9 +315,18 @@ def run() -> None:
                 equal_rank * 32,
                 equal_metrics,
             )
+            print_result(
+                worker,
+                kv,
+                "equal BF16 PCA",
+                equal_bf16_rank,
+                equal_bf16_rank * 16,
+                equal_bf16_metrics,
+            )
             all_metrics["DP production"].append(dp_metrics)
             all_metrics["legacy FP32 PCA"].append(legacy_metrics)
             all_metrics["equal FP32 PCA"].append(equal_metrics)
+            all_metrics["equal BF16 PCA"].append(equal_bf16_metrics)
             torch.npu.synchronize()
             torch.npu.empty_cache()
 
