@@ -269,13 +269,16 @@ def run() -> None:
             )
 
             original_features = mean.shape[0]
-            legacy_rank = min(
+            pca_only_rank = min(
                 basis.shape[1], original_features // args.compression_ratio
             )
             equal_rank = min(basis.shape[1], dp_bits // 32)
             equal_bf16_rank = min(basis.shape[1], dp_bits // 16)
-            legacy_reconstructed = reconstruct_cutoff(
-                projected, mean, basis, legacy_rank
+            pca_only_reconstructed = reconstruct_cutoff(
+                projected.to(cache_dtype).to(torch.float32),
+                mean,
+                basis,
+                pca_only_rank,
             )
             equal_reconstructed = reconstruct_cutoff(
                 projected, mean, basis, equal_rank
@@ -288,7 +291,7 @@ def run() -> None:
             )
 
             dp_metrics = measure(source, dp_reconstructed)
-            legacy_metrics = measure(source, legacy_reconstructed)
+            pca_only_metrics = measure(source, pca_only_reconstructed)
             equal_metrics = measure(source, equal_reconstructed)
             equal_bf16_metrics = measure(source, equal_bf16_reconstructed)
             print_result(
@@ -302,10 +305,10 @@ def run() -> None:
             print_result(
                 worker,
                 kv,
-                "legacy FP32 PCA",
-                legacy_rank,
-                legacy_rank * 32,
-                legacy_metrics,
+                f"PCA-only {args.cache_dtype}",
+                pca_only_rank,
+                pca_only_rank * cache_dtype.itemsize * 8,
+                pca_only_metrics,
             )
             print_result(
                 worker,
@@ -324,7 +327,7 @@ def run() -> None:
                 equal_bf16_metrics,
             )
             all_metrics["DP production"].append(dp_metrics)
-            all_metrics["legacy FP32 PCA"].append(legacy_metrics)
+            all_metrics[f"PCA-only {args.cache_dtype}"].append(pca_only_metrics)
             all_metrics["equal FP32 PCA"].append(equal_metrics)
             all_metrics["equal BF16 PCA"].append(equal_bf16_metrics)
             torch.npu.synchronize()

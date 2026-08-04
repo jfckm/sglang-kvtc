@@ -6619,7 +6619,10 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-kvtc-quant-disable",
             action="store_true",
-            help="Disable KVTC quantization and use the legacy FP32 PCA cutoff path",
+            help=(
+                "Disable adaptive KVTC quantization and store the PCA cutoff in "
+                "the runtime KV-cache dtype"
+            ),
         )
         parser.add_argument(
             "--hicache-kvtc-sw",
