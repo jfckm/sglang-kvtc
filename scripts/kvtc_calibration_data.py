@@ -64,12 +64,6 @@ class DumpTensorSet:
 
 
 @dataclass(frozen=True)
-class SampleAllocation:
-    tensor_set: DumpTensorSet
-    token_count: int
-
-
-@dataclass(frozen=True)
 class LoadedTensorSet:
     tensor_set: DumpTensorSet
     tensor: torch.Tensor
@@ -364,30 +358,6 @@ def select_records(
     ]
 
 
-def allocate_samples(
-    records: list[DumpTensorSet], target: int, policy: SamplingPolicy
-) -> list[SampleAllocation]:
-    if not records:
-        return []
-    dataset_count = len({record.dataset for record in records})
-    strict_groups = len({(record.dataset, record.bucket) for record in records})
-    dataset_records = Counter(record.dataset for record in records)
-    strict_records = Counter((record.dataset, record.bucket) for record in records)
-
-    allocations = []
-    for record in records:
-        if policy is SamplingPolicy.STRICT:
-            count = math.ceil(
-                target / strict_groups / strict_records[(record.dataset, record.bucket)]
-            )
-        elif policy is SamplingPolicy.RELAXED:
-            count = math.ceil(target / dataset_count / dataset_records[record.dataset])
-        else:
-            count = math.ceil(target / len(records))
-        allocations.append(SampleAllocation(record, count))
-    return allocations
-
-
 def load_tensor(paths: tuple[Path, ...]) -> tuple[torch.Tensor | None, int | None]:
     """Load one request only when every chunk has the same complete layer set."""
     if not paths:
@@ -552,50 +522,76 @@ def sample_pool(
     seed: int,
     purpose: str,
 ) -> torch.Tensor:
-    allocations = allocate_samples(
-        [entry.tensor_set for entry in pool],
-        target,
-        policy,
-    )
-    tensors = {entry.tensor_set: entry.tensor for entry in pool}
+    grouped = defaultdict(list)
+    for entry in pool:
+        record = entry.tensor_set
+        if policy is SamplingPolicy.STRICT:
+            group = (record.dataset, record.bucket)
+        elif policy is SamplingPolicy.RELAXED:
+            group = (record.dataset,)
+        else:
+            group = ()
+        grouped[group].append(entry)
+    if not grouped:
+        raise RuntimeError(f"No valid dump requests remain for {purpose}")
+
+    tokens_per_group = target // len(grouped)
+    if tokens_per_group == 0:
+        raise ValueError(
+            f"Cannot split {target} requested tokens evenly across "
+            f"{len(grouped)} sampling pools"
+        )
+
     rng = random.Random(seed)
     samples = []
-    collected = Counter()
+    collected = {}
     kv = pool[0].tensor_set.kv if pool else "KV"
-    for allocation in allocations:
-        record = allocation.tensor_set
-        tensor = tensors[record]
-        try:
-            if allocation.token_count > tensor.shape[0]:
-                raise ValueError(
-                    f"sampling budget {allocation.token_count} exceeds the "
-                    f"{tensor.shape[0]} usable tokens in the request"
-                )
-            indices = sorted(rng.sample(range(tensor.shape[0]), allocation.token_count))
-            samples.append(tensor[indices].to(dtype=torch.float32, copy=True))
-            collected[(record.dataset, record.bucket)] += allocation.token_count
-        except (RuntimeError, ValueError) as error:
-            logger.warning("Skipping %s: %s", record.paths[0], error)
+    sorted_groups = sorted(
+        grouped.items(),
+        key=lambda item: tuple(
+            str(value) if isinstance(value, Path) else int(value) for value in item[0]
+        ),
+    )
+    for group, entries in sorted_groups:
+        capacity = sum(entry.tensor.shape[0] for entry in entries)
+        if capacity < tokens_per_group:
+            label = "/".join(
+                str(value) if isinstance(value, Path) else value.name.lower()
+                for value in group
+            ) or "all"
+            raise RuntimeError(
+                f"Sampling pool {label} has only {capacity} usable {kv} tokens; "
+                f"{tokens_per_group} are required for {purpose}"
+            )
 
-    if not samples:
-        raise RuntimeError(f"No valid {kv} dump requests remain for {purpose}")
+        indices = sorted(rng.sample(range(capacity), tokens_per_group))
+        first = 0
+        index_offset = 0
+        for entry in entries:
+            end = first + entry.tensor.shape[0]
+            local_indices = []
+            while index_offset < len(indices) and indices[index_offset] < end:
+                local_indices.append(indices[index_offset] - first)
+                index_offset += 1
+            if local_indices:
+                samples.append(
+                    entry.tensor[local_indices].to(dtype=torch.float32, copy=True)
+                )
+            first = end
+        collected[group] = tokens_per_group
+
     data = torch.concat(samples, dim=0).flatten(start_dim=1)
     torch.cpu.synchronize()
-    if data.shape[0] < target:
-        raise RuntimeError(
-            f"Collected only {data.shape[0]}/{target} {kv} tokens for {purpose}"
-        )
-    data = data[:target]
-    for (dataset, bucket), count in sorted(
-        collected.items(), key=lambda item: (str(item[0][0]), int(item[0][1]))
-    ):
+    for group, count in collected.items():
+        label = "/".join(
+            str(value) if isinstance(value, Path) else value.name.lower()
+            for value in group
+        ) or "all"
         logger.info(
-            "%s %s/%s sampled tokens from %s/%s",
+            "%s sampled %s tokens from pool %s",
             purpose,
             count,
-            target,
-            dataset,
-            bucket.name.lower(),
+            label,
         )
     logger.info("Collected %s/%s %s tokens for %s", data.shape[0], target, kv, purpose)
     return data
