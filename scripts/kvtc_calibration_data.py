@@ -21,6 +21,7 @@ SLIDING_WINDOW_TOKENS = 128
 
 class SamplingPolicy(Enum):
     STRICT = "strict"
+    BEST_EFFORT = "best-effort"
     RELAXED = "relaxed"
     OPEN = "open"
 
@@ -525,7 +526,7 @@ def sample_pool(
     grouped = defaultdict(list)
     for entry in pool:
         record = entry.tensor_set
-        if policy is SamplingPolicy.STRICT:
+        if policy in (SamplingPolicy.STRICT, SamplingPolicy.BEST_EFFORT):
             group = (record.dataset, record.bucket)
         elif policy is SamplingPolicy.RELAXED:
             group = (record.dataset,)
@@ -554,17 +555,22 @@ def sample_pool(
     )
     for group, entries in sorted_groups:
         capacity = sum(entry.tensor.shape[0] for entry in entries)
+        sample_count = tokens_per_group
         if capacity < tokens_per_group:
             label = "/".join(
                 str(value) if isinstance(value, Path) else value.name.lower()
                 for value in group
             ) or "all"
-            raise RuntimeError(
+            message = (
                 f"Sampling pool {label} has only {capacity} usable {kv} tokens; "
-                f"{tokens_per_group} are required for {purpose}"
+                f"{tokens_per_group} are requested for {purpose}"
             )
+            if policy is not SamplingPolicy.BEST_EFFORT:
+                raise RuntimeError(message)
+            logger.warning(message)
+            sample_count = capacity
 
-        indices = sorted(rng.sample(range(capacity), tokens_per_group))
+        indices = sorted(rng.sample(range(capacity), sample_count))
         first = 0
         index_offset = 0
         for entry in entries:
@@ -578,7 +584,7 @@ def sample_pool(
                     entry.tensor[local_indices].to(dtype=torch.float32, copy=True)
                 )
             first = end
-        collected[group] = tokens_per_group
+        collected[group] = sample_count
 
     data = torch.concat(samples, dim=0).flatten(start_dim=1)
     torch.cpu.synchronize()
