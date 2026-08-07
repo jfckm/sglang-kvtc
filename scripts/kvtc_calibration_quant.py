@@ -323,7 +323,7 @@ def _assign_quantization(
 ) -> list[tuple[int, str]]:
     rank = error_table.rank
     budget = math.floor(16 * original_feature_count / compression_ratio)
-    frontiers = [[{} for _ in QUANT_DTYPES] for _ in range(rank + 1)]
+    frontiers = [{} for _ in range(rank + 1)]
 
     started = time.perf_counter()
     with tqdm(
@@ -334,11 +334,11 @@ def _assign_quantization(
         disable=None,
     ) as progress:
         for end in range(1, rank + 1):
-            for dtype_index, dtype_name in enumerate(QUANT_DTYPES):
+            candidates = []
+            for dtype_name in QUANT_DTYPES:
                 block_sizes = (
                     INT4_BLOCK_SIZES if dtype_name == "int4" else QUANT_BLOCK_SIZES
                 )
-                candidates = []
                 for size in block_sizes:
                     start = end - size
                     group_cost = quant_group_bits(size, dtype_name)
@@ -352,31 +352,32 @@ def _assign_quantization(
                             DPRecord(quant_error, group_cost, None, (size, dtype_name))
                         )
                         continue
-                    for previous_dtype in range(dtype_index + 1):
-                        for previous in frontiers[start][previous_dtype].values():
-                            cost = previous.cost + group_cost
-                            if cost <= budget:
-                                candidates.append(
-                                    DPRecord(
-                                        previous.error + quant_error,
-                                        cost,
-                                        previous,
-                                        (size, dtype_name),
-                                    )
+                    for previous in frontiers[start].values():
+                        cost = previous.cost + group_cost
+                        if cost <= budget:
+                            candidates.append(
+                                DPRecord(
+                                    previous.error + quant_error,
+                                    cost,
+                                    previous,
+                                    (size, dtype_name),
                                 )
-                frontiers[end][dtype_index] = _pareto_frontier(candidates)
+                            )
                 progress.update()
+            frontiers[end] = _pareto_frontier(candidates)
 
     best = None
     best_total_error = math.inf
     for end in range(1, rank + 1):
         omitted_error = error_table.tail_errors[end]
-        for dtype_frontier in frontiers[end]:
-            for record in dtype_frontier.values():
-                total_error = record.error + omitted_error
-                if total_error < best_total_error:
-                    best = record
-                    best_total_error = total_error
+        for record in frontiers[end].values():
+            total_error = record.error + omitted_error
+            if total_error < best_total_error or (
+                total_error == best_total_error
+                and (best is None or record.cost < best.cost)
+            ):
+                best = record
+                best_total_error = total_error
     if best is None:
         raise ValueError(
             f"Compression ratio {compression_ratio} has a {budget}-bit budget, "

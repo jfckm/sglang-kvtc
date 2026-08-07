@@ -62,7 +62,6 @@ def build_quant_layout(
     groups = []
     feature_offset = 0
     metadata_count = 0
-    previous_precision = None
     payload_offsets = {name: 0 for name in KVTC_QUANT_STORAGE_DTYPES}
     for group_index, entry in enumerate(schema):
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
@@ -79,14 +78,6 @@ def build_quant_layout(
             raise ValueError(
                 f"{matrix_name} KVTC quantization group {group_index} has unsupported dtype {dtype_name!r}"
             )
-        precision = KVTC_QUANT_PRECISION_BITS[dtype_name]
-        if previous_precision is not None and precision > previous_precision:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization schema must use non-increasing precision; "
-                f"group {group_index} changes from {previous_precision} to {precision} bits"
-            )
-        previous_precision = precision
-
         if dtype_name == "int4":
             if group_size < 8 or group_size % 8 != 0:
                 raise ValueError(
