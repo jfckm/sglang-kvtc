@@ -96,8 +96,6 @@ OTHER_ARGS = [
     84,
     "--dtype",
     "bfloat16",
-    "--reasoning-parser",
-    "qwen3",
     "--tool-call-parser",
     "qwen",
     "--tokenizer-path",
