@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
+from typing import Sequence
 
 import torch
 
@@ -179,36 +180,62 @@ class Rope:
         return torch.cat((inverted, passthrough), dim=-1)
 
 
-def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
-    if not input_dir.is_dir():
-        raise ValueError(f"Input directory does not exist: {input_dir}")
+def _discover_workers(directory: Path) -> list[str]:
+    return sorted(
+        (
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_dir() and WORKER_DIR_PATTERN.fullmatch(entry.name)
+        ),
+        key=lambda worker: tuple(
+            map(int, WORKER_DIR_PATTERN.fullmatch(worker).groups())
+        ),
+    )
+
+
+def discover_dump_directories(
+    input_dirs: Path | Sequence[Path],
+) -> tuple[list[Path], list[str]]:
+    if isinstance(input_dirs, Path):
+        input_dirs = (input_dirs,)
+    if not input_dirs:
+        raise ValueError("At least one input directory is required")
 
     dump_dirs = []
     worker_sets = {}
-    for candidate in sorted(input_dir.iterdir()):
-        if not candidate.is_dir():
-            continue
-        workers = sorted(
-            (
-                entry.name
-                for entry in candidate.iterdir()
-                if entry.is_dir() and WORKER_DIR_PATTERN.fullmatch(entry.name)
-            ),
-            key=lambda worker: tuple(
-                map(int, WORKER_DIR_PATTERN.fullmatch(worker).groups())
-            ),
-        )
-        if workers:
-            dump_dirs.append(candidate)
-            worker_sets[candidate] = workers
-            logger.info(
-                "Discovered dump directory %s with workers: %s", candidate, workers
+    discovered_paths = set()
+    for input_dir in input_dirs:
+        if not input_dir.is_dir():
+            raise ValueError(f"Input directory does not exist: {input_dir}")
+
+        workers = _discover_workers(input_dir)
+        candidates = [(input_dir, workers)] if workers else []
+        if not candidates:
+            candidates = [
+                (candidate, candidate_workers)
+                for candidate in sorted(input_dir.iterdir())
+                if candidate.is_dir()
+                and (candidate_workers := _discover_workers(candidate))
+            ]
+
+        if not candidates:
+            raise ValueError(
+                f"No dump directories with tp_<X>_pp_<Y> workers found in {input_dir}"
             )
 
-    if not dump_dirs:
-        raise ValueError(
-            f"No dump directories with tp_<X>_pp_<Y> workers found in {input_dir}"
-        )
+        for dump_dir, workers in candidates:
+            canonical_path = dump_dir.resolve()
+            if canonical_path in discovered_paths:
+                raise ValueError(
+                    f"Dump directory was specified more than once: {dump_dir}"
+                )
+            discovered_paths.add(canonical_path)
+            dump_dirs.append(dump_dir)
+            worker_sets[dump_dir] = workers
+            logger.info(
+                "Discovered dump directory %s with workers: %s", dump_dir, workers
+            )
+
     workers = worker_sets[dump_dirs[0]]
     for dump_dir in dump_dirs[1:]:
         if worker_sets[dump_dir] != workers:
@@ -557,10 +584,13 @@ def sample_pool(
         capacity = sum(entry.tensor.shape[0] for entry in entries)
         sample_count = tokens_per_group
         if capacity < tokens_per_group:
-            label = "/".join(
-                str(value) if isinstance(value, Path) else value.name.lower()
-                for value in group
-            ) or "all"
+            label = (
+                "/".join(
+                    str(value) if isinstance(value, Path) else value.name.lower()
+                    for value in group
+                )
+                or "all"
+            )
             message = (
                 f"Sampling pool {label} has only {capacity} usable {kv} tokens; "
                 f"{tokens_per_group} are requested for {purpose}"
@@ -589,10 +619,13 @@ def sample_pool(
     data = torch.concat(samples, dim=0).flatten(start_dim=1)
     torch.cpu.synchronize()
     for group, count in collected.items():
-        label = "/".join(
-            str(value) if isinstance(value, Path) else value.name.lower()
-            for value in group
-        ) or "all"
+        label = (
+            "/".join(
+                str(value) if isinstance(value, Path) else value.name.lower()
+                for value in group
+            )
+            or "all"
+        )
         logger.info(
             "%s sampled %s tokens from pool %s",
             purpose,

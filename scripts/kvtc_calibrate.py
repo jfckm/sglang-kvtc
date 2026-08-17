@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"\n{os.path.basename(__file__)}"
             " (-N <token_sample_count> --niter <svd iterations> -q <svd rank>"
             " | --reuse-pca <calibration_file>)"
-            " -i <dump-parent-directory>"
+            " -i <dump-directory> [-i <dump-directory> ...]"
             " -o <output_path> -m <model_path>\n"
         )
     )
@@ -117,8 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-i",
         "--input-dir",
+        action="append",
+        type=Path,
         required=True,
-        help="Parent directory containing calibration dump directories",
+        help=(
+            "Dump directory or parent containing dataset dump directories; "
+            "repeat for multiple locations"
+        ),
     )
     parser.add_argument("-o", "--output", required=True, help="Calibration file output")
     parser.add_argument("--log-dir", required=True, help="Calibration log directory")
@@ -173,8 +178,6 @@ def run() -> None:
     args = parser.parse_args()
     validate_args(parser, args)
 
-    input_dir = Path(args.input_dir)
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -192,7 +195,7 @@ def run() -> None:
         args.log_level,
     )
 
-    dump_dirs, workers = discover_dump_directories(input_dir)
+    dump_dirs, workers = discover_dump_directories(args.input_dir)
     manifest = scan_dump_manifest(dump_dirs, workers)
     output = (
         load_pca_artifact(args.reuse_pca, workers)

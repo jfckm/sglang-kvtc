@@ -48,7 +48,17 @@ def build_parser() -> argparse.ArgumentParser:
             "the production NPU host-cache quantization methods."
         )
     )
-    parser.add_argument("-i", "--input-dir", type=Path, required=True)
+    parser.add_argument(
+        "-i",
+        "--input-dir",
+        action="append",
+        type=Path,
+        required=True,
+        help=(
+            "Dump directory or parent containing dataset dump directories; "
+            "repeat for multiple locations"
+        ),
+    )
     parser.add_argument("-c", "--config", type=Path, required=True)
     parser.add_argument("-m", "--model-dir", required=True)
     parser.add_argument("-r", "--compression-ratio", type=int, required=True)
@@ -102,12 +112,8 @@ def make_runtime_harness(page_size: int, page_count: int, dtype: torch.dtype):
         device="cpu",
         dtype=dtype,
         device_pool=SimpleNamespace(device=device),
-        _QUANT_STORAGE_DTYPES=(
-            NPUMHATokenToKVPoolCompressed._QUANT_STORAGE_DTYPES
-        ),
-        _QUANT_METADATA_DTYPE=(
-            NPUMHATokenToKVPoolCompressed._QUANT_METADATA_DTYPE
-        ),
+        _QUANT_STORAGE_DTYPES=(NPUMHATokenToKVPoolCompressed._QUANT_STORAGE_DTYPES),
+        _QUANT_METADATA_DTYPE=(NPUMHATokenToKVPoolCompressed._QUANT_METADATA_DTYPE),
     )
     return harness
 
@@ -212,9 +218,7 @@ def run() -> None:
         for kv_index, kv in enumerate(KV):
             matrix_configs = config.get(kv.matrix_name)
             if not isinstance(matrix_configs, dict) or worker not in matrix_configs:
-                raise ValueError(
-                    f"KVTC config is missing {kv.matrix_name}/{worker}"
-                )
+                raise ValueError(f"KVTC config is missing {kv.matrix_name}/{worker}")
             matrix_params = matrix_configs[worker]
             if not isinstance(matrix_params, dict):
                 raise ValueError(
@@ -257,8 +261,7 @@ def run() -> None:
                 f"{kv.name}/{worker}",
             )
             dp_reconstructed = (
-                dp_coefficients.to(basis.dtype)
-                @ basis[:, : layout.feature_count].T
+                dp_coefficients.to(basis.dtype) @ basis[:, : layout.feature_count].T
                 + mean
             )
             dp_bits = sum(
@@ -280,9 +283,7 @@ def run() -> None:
                 basis,
                 pca_only_rank,
             )
-            equal_reconstructed = reconstruct_cutoff(
-                projected, mean, basis, equal_rank
-            )
+            equal_reconstructed = reconstruct_cutoff(projected, mean, basis, equal_rank)
             equal_bf16_reconstructed = reconstruct_cutoff(
                 projected.to(torch.bfloat16).to(torch.float32),
                 mean,
