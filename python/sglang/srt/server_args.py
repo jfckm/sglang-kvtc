@@ -709,6 +709,7 @@ class ServerArgs:
     hicache_kvtc_k_cr: float = 0.0
     hicache_kvtc_v_cr: float = 0.0
     hicache_kvtc_quant_disable: bool = False
+    hicache_kvtc_quant_debug: bool = False
     hicache_kvtc_sliding_window: int = 0
     dump_kv_path: str = ""
 
@@ -6622,6 +6623,14 @@ class ServerArgs:
             help=(
                 "Disable adaptive KVTC quantization and store the PCA cutoff in "
                 "the runtime KV-cache dtype"
+            ),
+        )
+        parser.add_argument(
+            "--hicache-kvtc-quant-debug",
+            action="store_true",
+            help=(
+                "Log a bounded first-page KVTC quantization round-trip for "
+                "diagnosing calibration/runtime parity"
             ),
         )
         parser.add_argument(

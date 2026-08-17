@@ -367,6 +367,7 @@ def _assign_quantization(
             frontiers[end] = _pareto_frontier(candidates)
 
     best = None
+    best_end = None
     best_total_error = math.inf
     for end in range(1, rank + 1):
         omitted_error = error_table.tail_errors[end]
@@ -377,6 +378,7 @@ def _assign_quantization(
                 and (best is None or record.cost < best.cost)
             ):
                 best = record
+                best_end = end
                 best_total_error = total_error
     if best is None:
         raise ValueError(
@@ -390,6 +392,7 @@ def _assign_quantization(
         else 0.0
     )
 
+    selected = best
     schema = []
     while best is not None:
         schema.append(best.group)
@@ -406,15 +409,54 @@ def _assign_quantization(
         else:
             merged.append((size, dtype_name))
     build_quant_layout(merged, page_size=1, basis_rank=rank, matrix_name="calibrated")
+    used_bits = sum(
+        quant_group_bits(size, dtype_name) for size, dtype_name in merged
+    )
     logger.info(
-        "DP ratio=%sx budget=%s bits used=%s relative_error=%s time=%.2fs schema=%s",
+        "DP ratio=%sx p=%s rank=%s budget=%s bits_per_rank=%.4f "
+        "used=%s effective_ratio=%.4fx retained=%s tail_error=%.7g "
+        "quant_error=%.7g total_error=%.7g relative_error=%.7g "
+        "time=%.2fs schema=%s",
         compression_ratio,
+        original_feature_count,
+        rank,
         budget,
-        sum(quant_group_bits(size, dtype_name) for size, dtype_name in merged),
+        budget / rank,
+        used_bits,
+        16 * original_feature_count / used_bits,
+        best_end,
+        error_table.tail_errors[best_end],
+        selected.error,
+        best_total_error,
         relative_error,
         time.perf_counter() - started,
         merged,
     )
+
+    feature_start = 0
+    for group_index, (size, dtype_name) in enumerate(schema):
+        feature_end = feature_start + size
+        group_error = error_table.block_errors[(feature_start, size, dtype_name)]
+        group_energy = (
+            error_table.tail_errors[feature_start]
+            - error_table.tail_errors[feature_end]
+        )
+        relative_group_error = (
+            math.sqrt(group_error / group_energy) if group_energy > 0 else 0.0
+        )
+        logger.info(
+            "DP group=%s range=%s:%s dtype=%s bits=%s energy=%.7g "
+            "error=%.7g relative_error=%.7g",
+            group_index,
+            feature_start,
+            feature_end,
+            dtype_name,
+            quant_group_bits(size, dtype_name),
+            group_energy,
+            group_error,
+            relative_group_error,
+        )
+        feature_start = feature_end
     return merged
 
 

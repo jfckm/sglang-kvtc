@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from scripts.kvtc_calibration_data import (  # noqa: E402
 )
 from scripts.kvtc_calibration_quant import (  # noqa: E402
     KVTC_FILE_VERSION,
+    _npu_integer_batch_errors,
 )
 from sglang.srt.mem_cache.kvtc_quant import quant_group_bits  # noqa: E402
 from sglang.srt.mem_cache.memory_pool_host import (  # noqa: E402
@@ -36,9 +38,21 @@ from sglang.srt.mem_cache.memory_pool_host import (  # noqa: E402
 
 @dataclass(frozen=True)
 class Metrics:
+    sse: float
     relative_l2: float
     rmse: float
     cosine: float
+
+
+@dataclass(frozen=True)
+class GroupMetrics:
+    feature_start: int
+    feature_end: int
+    dtype: str
+    bits: int
+    energy: float
+    production_sse: float
+    calibration_sse: float
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("bfloat16", "float16"),
         default="bfloat16",
         help="Device KV-cache dtype used by the production dequantizer",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Optional path for machine-readable diagnostic results",
     )
     return parser
 
@@ -175,7 +194,75 @@ def measure(source: torch.Tensor, reconstructed: torch.Tensor) -> Metrics:
     )
     rmse = float(torch.sqrt(torch.mean(difference.square())).item())
     cosine = float(F.cosine_similarity(source, reconstructed, dim=1).mean().item())
-    return Metrics(relative_l2, rmse, cosine)
+    return Metrics(float(difference.square().sum().item()), relative_l2, rmse, cosine)
+
+
+def measure_group_errors(
+    projected: torch.Tensor,
+    reconstructed: torch.Tensor,
+    layout: object,
+) -> list[GroupMetrics]:
+    results = []
+    for group in layout.groups:
+        source = projected[:, group.feature_start : group.feature_end]
+        runtime = reconstructed[:, group.feature_start : group.feature_end]
+        production_sse = float((source - runtime).square().sum().item())
+        energy = float(source.square().sum().item())
+
+        if group.dtype_name == "float32":
+            calibration_sse = 0.0
+        elif group.dtype_name == "bfloat16":
+            calibration_sse = float(
+                (source - source.to(torch.bfloat16).to(torch.float32))
+                .square()
+                .sum()
+                .item()
+            )
+        else:
+            calibration_sse = float(
+                _npu_integer_batch_errors(
+                    source.unsqueeze(0), group.dtype_name
+                ).item()
+            )
+
+        group_size = group.feature_end - group.feature_start
+        results.append(
+            GroupMetrics(
+                feature_start=group.feature_start,
+                feature_end=group.feature_end,
+                dtype=group.dtype_name,
+                bits=quant_group_bits(group_size, group.dtype_name),
+                energy=energy,
+                production_sse=production_sse,
+                calibration_sse=calibration_sse,
+            )
+        )
+    return results
+
+
+def measure_basis(basis: torch.Tensor, seed: int) -> dict[str, float]:
+    column_norms = basis.square().sum(dim=0)
+    max_column_norm_error = float((column_norms - 1).abs().max().item())
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    probe_errors = []
+    for _ in range(4):
+        probe = torch.randn(
+            basis.shape[1], generator=generator, dtype=basis.dtype
+        ).to(basis.device)
+        transformed = basis.T @ (basis @ probe)
+        probe_errors.append(
+            float(
+                (
+                    torch.linalg.vector_norm(transformed - probe)
+                    / torch.linalg.vector_norm(probe)
+                ).item()
+            )
+        )
+    return {
+        "max_column_norm_error": max_column_norm_error,
+        "max_orthogonality_probe_error": max(probe_errors),
+    }
 
 
 def print_result(
@@ -188,7 +275,8 @@ def print_result(
 ) -> None:
     print(
         f"{worker:<14} {kv.name:<1} {method:<18} rank={rank:<5} "
-        f"bits/token={bits:<6} rel_l2={metrics.relative_l2:.7f} "
+        f"bits/token={bits:<6} sse={metrics.sse:.7g} "
+        f"rel_l2={metrics.relative_l2:.7f} "
         f"rmse={metrics.rmse:.7f} cosine={metrics.cosine:.7f}"
     )
 
@@ -213,6 +301,7 @@ def run() -> None:
         f"ratio={args.compression_ratio} cache_dtype={cache_dtype}"
     )
     all_metrics = defaultdict(list)
+    diagnostic_results = []
 
     for worker_index, worker in enumerate(workers):
         for kv_index, kv in enumerate(KV):
@@ -270,6 +359,22 @@ def run() -> None:
                 )
                 for group in layout.groups
             )
+            group_metrics = measure_group_errors(
+                projected, dp_coefficients, layout
+            )
+            quantization_sse = sum(
+                group.production_sse for group in group_metrics
+            )
+            calibration_sse = sum(
+                group.calibration_sse for group in group_metrics
+            )
+            tail_sse = float(
+                projected[:, layout.feature_count :].square().sum().item()
+            )
+            coefficient_sse = quantization_sse + tail_sse
+
+            full_pca_reconstructed = projected @ basis.T + mean
+            pca_floor_metrics = measure(source, full_pca_reconstructed)
 
             original_features = mean.shape[0]
             pca_only_rank = min(
@@ -295,6 +400,16 @@ def run() -> None:
             pca_only_metrics = measure(source, pca_only_reconstructed)
             equal_metrics = measure(source, equal_reconstructed)
             equal_bf16_metrics = measure(source, equal_bf16_reconstructed)
+            incremental_sse = dp_metrics.sse - pca_floor_metrics.sse
+            identity_gap = incremental_sse - coefficient_sse
+            identity_relative_gap = abs(identity_gap) / max(coefficient_sse, 1e-30)
+            estimator_relative_gap = abs(calibration_sse - quantization_sse) / max(
+                quantization_sse, 1e-30
+            )
+            basis_metrics = measure_basis(
+                basis,
+                args.seed + worker_index * 2 + kv_index,
+            )
             print_result(
                 worker,
                 kv,
@@ -327,6 +442,69 @@ def run() -> None:
                 equal_bf16_rank * 16,
                 equal_bf16_metrics,
             )
+            print(
+                f"{worker:<14} {kv.name:<1} decomposition "
+                f"pca_floor_sse={pca_floor_metrics.sse:.7g} "
+                f"quant_sse={quantization_sse:.7g} "
+                f"calibration_sse={calibration_sse:.7g} "
+                f"tail_sse={tail_sse:.7g} coeff_sse={coefficient_sse:.7g} "
+                f"incremental_sse={incremental_sse:.7g} "
+                f"identity_gap={identity_gap:.7g} "
+                f"identity_relative_gap={identity_relative_gap:.7g} "
+                f"estimator_relative_gap={estimator_relative_gap:.7g}"
+            )
+            print(
+                f"{worker:<14} {kv.name:<1} basis "
+                f"max_column_norm_error={basis_metrics['max_column_norm_error']:.7g} "
+                "max_orthogonality_probe_error="
+                f"{basis_metrics['max_orthogonality_probe_error']:.7g}"
+            )
+            for group_index, group in enumerate(group_metrics):
+                relative_error = (
+                    (group.production_sse / group.energy) ** 0.5
+                    if group.energy > 0
+                    else 0.0
+                )
+                parity_gap = group.production_sse - group.calibration_sse
+                print(
+                    f"{worker:<14} {kv.name:<1} group={group_index:<3} "
+                    f"range={group.feature_start}:{group.feature_end} "
+                    f"dtype={group.dtype:<8} bits={group.bits:<6} "
+                    f"energy={group.energy:.7g} production_sse={group.production_sse:.7g} "
+                    f"calibration_sse={group.calibration_sse:.7g} "
+                    f"parity_gap={parity_gap:.7g} relative_error={relative_error:.7g}"
+                )
+
+            diagnostic_results.append(
+                {
+                    "worker": worker,
+                    "matrix": kv.name,
+                    "cache_dtype": args.cache_dtype,
+                    "original_features": mean.shape[0],
+                    "basis_rank": basis.shape[1],
+                    "retained_rank": layout.feature_count,
+                    "bits_per_token": dp_bits,
+                    "effective_compression_ratio": 16 * mean.shape[0] / dp_bits,
+                    "schema": [
+                        [
+                            group.feature_end - group.feature_start,
+                            group.dtype_name,
+                        ]
+                        for group in layout.groups
+                    ],
+                    "basis": basis_metrics,
+                    "pca_floor_sse": pca_floor_metrics.sse,
+                    "production_quantization_sse": quantization_sse,
+                    "calibration_quantization_sse": calibration_sse,
+                    "tail_sse": tail_sse,
+                    "coefficient_sse": coefficient_sse,
+                    "incremental_reconstruction_sse": incremental_sse,
+                    "identity_gap": identity_gap,
+                    "identity_relative_gap": identity_relative_gap,
+                    "estimator_relative_gap": estimator_relative_gap,
+                    "groups": [group.__dict__ for group in group_metrics],
+                }
+            )
             all_metrics["DP production"].append(dp_metrics)
             all_metrics[f"PCA-only {args.cache_dtype}"].append(pca_only_metrics)
             all_metrics["equal FP32 PCA"].append(equal_metrics)
@@ -343,6 +521,23 @@ def run() -> None:
             f"rmse={sum(item.rmse for item in entries) / count:.7f} "
             f"cosine={sum(item.cosine for item in entries) / count:.7f}"
         )
+
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(
+            json.dumps(
+                {
+                    "sample_tokens": sample_tokens,
+                    "page_size": args.page_size,
+                    "compression_ratio": args.compression_ratio,
+                    "cache_dtype": args.cache_dtype,
+                    "entries": diagnostic_results,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(f"Wrote diagnostics to {args.output_json}")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.kvtc_quant import (
     KVTCQuantGroup as _KVTCQuantGroup,
     KVTCQuantLayout as _KVTCQuantLayout,
     build_quant_layout,
+    quant_group_bits,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu, get_available_gpu_memory
 
@@ -3310,6 +3311,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
         kvtc_quant_disable: bool = False,
+        kvtc_quant_debug: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
         tp_size: int = 1,
@@ -3323,6 +3325,9 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.compressed_dtype = device_pool.dtype
         self.kvtc_quant_disable = kvtc_quant_disable
+        self.kvtc_quant_debug = kvtc_quant_debug
+        self._kvtc_quant_debugged_pages = set()
+        self._kvtc_quant_debugged_activity = set()
         if self.kvtc_quant_disable:
             self._validate_pca_storage_dtype(self.compressed_dtype)
         self.rotary_emb = rotary_emb
@@ -3345,6 +3350,20 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.v_kvtc = False
         self.k_quant_layout = None
         self.v_quant_layout = None
+
+        if getattr(self, "kvtc_quant_debug", False):
+            logger.info(
+                "[KVTC-QUANT-DIAG] torch=%s torch_npu=%s cache_dtype=%s "
+                "store_dtype=%s page_size=%s has_torch_int4=%s "
+                "has_torch_quint4x2=%s",
+                torch.__version__,
+                getattr(torch_npu, "__version__", "<unknown>"),
+                self.compressed_dtype,
+                self.dtype,
+                self.page_size,
+                hasattr(torch, "int4"),
+                hasattr(torch, "quint4x2"),
+            )
 
         p = self.layer_num * self.head_num * self.head_dim
 
@@ -3485,6 +3504,33 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             basis_rank=basis_rank,
             matrix_name=matrix_name,
         )
+
+        if getattr(self, "kvtc_quant_debug", False):
+            original_feature_count = self.layer_num * self.head_num * self.head_dim
+            used_bits = sum(
+                quant_group_bits(
+                    group.feature_end - group.feature_start,
+                    group.dtype_name,
+                )
+                for group in layout.groups
+            )
+            logger.info(
+                "[KVTC-QUANT-DIAG] matrix=%s ratio=%s basis_rank=%s "
+                "retained=%s bits_per_token=%s effective_ratio=%.4fx groups=%s",
+                matrix_name,
+                int(ratio),
+                basis_rank,
+                layout.feature_count,
+                used_bits,
+                16 * original_feature_count / used_bits,
+                [
+                    (
+                        group.feature_end - group.feature_start,
+                        group.dtype_name,
+                    )
+                    for group in layout.groups
+                ],
+            )
 
         missing_ops = (
             [
@@ -3776,6 +3822,108 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
         return X
 
+    def _log_quant_page_diagnostics(
+        self,
+        matrix_name: str,
+        source: torch.Tensor,
+        host_page: int,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        if not self.kvtc_quant_debug or matrix_name in self._kvtc_quant_debugged_pages:
+            return
+        self._kvtc_quant_debugged_pages.add(matrix_name)
+
+        reconstructed = self._dequantize_page(
+            host_page,
+            layout,
+            payload_buffers,
+            scales,
+            offsets,
+        )
+        retained_source = source[:, : layout.feature_count].to(torch.float32)
+        total_energy = float(retained_source.square().sum().item())
+        total_error = float(
+            (retained_source - reconstructed).square().sum().item()
+        )
+        source_nonfinite = int((~torch.isfinite(retained_source)).sum().item())
+        reconstructed_nonfinite = int(
+            (~torch.isfinite(reconstructed)).sum().item()
+        )
+        logger.info(
+            "[KVTC-QUANT-DIAG] matrix=%s first_quantized_page=%s "
+            "energy=%.7g roundtrip_sse=%.7g relative_error=%.7g "
+            "source_nonfinite=%s reconstructed_nonfinite=%s",
+            matrix_name,
+            host_page,
+            total_energy,
+            total_error,
+            (total_error / total_energy) ** 0.5 if total_energy > 0 else 0.0,
+            source_nonfinite,
+            reconstructed_nonfinite,
+        )
+
+        for group_index, group in enumerate(layout.groups):
+            group_source = retained_source[
+                :, group.feature_start : group.feature_end
+            ]
+            group_reconstructed = reconstructed[
+                :, group.feature_start : group.feature_end
+            ]
+            energy = float(group_source.square().sum().item())
+            error = float(
+                (group_source - group_reconstructed).square().sum().item()
+            )
+            metadata = ""
+            if group.metadata_index is not None:
+                group_scales = scales[host_page, :, group.metadata_index].to(
+                    torch.float32
+                )
+                group_offsets = offsets[host_page, :, group.metadata_index].to(
+                    torch.float32
+                )
+                metadata = (
+                    f" scale_min={float(group_scales.min().item()):.7g}"
+                    f" scale_max={float(group_scales.max().item()):.7g}"
+                    f" offset_min={float(group_offsets.min().item()):.7g}"
+                    f" offset_max={float(group_offsets.max().item()):.7g}"
+                    f" metadata_nonfinite="
+                    f"{int((~torch.isfinite(group_scales)).sum().item() + (~torch.isfinite(group_offsets)).sum().item())}"
+                )
+            logger.info(
+                "[KVTC-QUANT-DIAG] matrix=%s group=%s range=%s:%s "
+                "dtype=%s bits=%s energy=%.7g roundtrip_sse=%.7g "
+                "relative_error=%.7g%s",
+                matrix_name,
+                group_index,
+                group.feature_start,
+                group.feature_end,
+                group.dtype_name,
+                quant_group_bits(
+                    group.feature_end - group.feature_start,
+                    group.dtype_name,
+                ),
+                energy,
+                error,
+                (error / energy) ** 0.5 if energy > 0 else 0.0,
+                metadata,
+            )
+
+    def _log_quant_activity(self, operation: str, page_count: int) -> None:
+        if (
+            not self.kvtc_quant_debug
+            or operation in self._kvtc_quant_debugged_activity
+        ):
+            return
+        self._kvtc_quant_debugged_activity.add(operation)
+        logger.info(
+            "[KVTC-QUANT-DIAG] first_%s page_count=%s",
+            operation,
+            page_count,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -3791,6 +3939,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         assert len(token_indices) == host_indices.size(0)
         assert(device_indices.size(0) % self.page_size == 0)
         num_pages = device_indices.size(0) // self.page_size
+        self._log_quant_activity("load", num_pages)
         token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
         for page in range(num_pages):
@@ -3864,6 +4013,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         assert len(token_indices) == host_indices.size(0), f"{len(token_indices)=} {host_indices.size(0)}"
         assert (device_indices.size(0) % self.page_size == 0)
         num_pages = device_indices.size(0) // self.page_size
+        self._log_quant_activity("backup", num_pages)
         token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
         for page in range(num_pages):
@@ -3888,6 +4038,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                         self.k_quant_scales,
                         self.k_quant_offsets,
                     )
+                    self._log_quant_page_diagnostics(
+                        "K",
+                        D_k,
+                        host_page,
+                        self.k_quant_layout,
+                        self.k_quant_buffers,
+                        self.k_quant_scales,
+                        self.k_quant_offsets,
+                    )
             else:
                 self.k_buffer[:, host_page, ...] = device_pool.k_buffer[:, device_page, ...].to(
                     device=self.device
@@ -3904,6 +4063,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     self.v_buffer[host_page] = D_v.to(device=self.device)
                 else:
                     self._quantize_page(
+                        D_v,
+                        host_page,
+                        self.v_quant_layout,
+                        self.v_quant_buffers,
+                        self.v_quant_scales,
+                        self.v_quant_offsets,
+                    )
+                    self._log_quant_page_diagnostics(
+                        "V",
                         D_v,
                         host_page,
                         self.v_quant_layout,
@@ -3957,6 +4125,7 @@ class NPUMHATokenToKVPoolHybrid:
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
         kvtc_quant_disable: bool = False,
+        kvtc_quant_debug: bool = False,
         enable_memory_saver: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
@@ -3983,6 +4152,7 @@ class NPUMHATokenToKVPoolHybrid:
                 kvtc_k_compression_ratio=kvtc_k_compression_ratio,
                 kvtc_v_compression_ratio=kvtc_v_compression_ratio,
                 kvtc_quant_disable=kvtc_quant_disable,
+                kvtc_quant_debug=kvtc_quant_debug,
                 rotary_emb=rotary_emb,
                 tp_rank=tp_rank,
                 tp_size=tp_size,
