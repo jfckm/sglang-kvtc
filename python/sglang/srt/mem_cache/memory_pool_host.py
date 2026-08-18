@@ -3300,7 +3300,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.page_size = page_size
         self.device = "cpu"
         self.dtype = device_pool.store_dtype
-        self.compressed_dtype = torch.float32
+        self.compressed_dtype = self.dtype
         self.rotary_emb = rotary_emb
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
