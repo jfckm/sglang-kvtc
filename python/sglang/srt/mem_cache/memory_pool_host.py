@@ -3798,6 +3798,11 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
                 continue
 
+            # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
+            # views with nonzero storage offsets. Materialize only affected groups.
+            if group.dtype_name == "int4" and payload.storage_offset() != 0:
+                payload = payload.clone()
+
             group_size = group.feature_end - group.feature_start
             expanded_scales = device_scales[:, group.metadata_index].repeat_interleave(
                 group_size
