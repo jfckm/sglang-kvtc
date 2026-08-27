@@ -10,6 +10,7 @@ import pprint
 import logging
 import sys
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 
@@ -29,6 +30,7 @@ from enum import Enum, IntEnum
 logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 KVTC_FILE_VERSION="v1-noquant"
+SVD_WORKERS = 4
 
 
 class Rope(object):
@@ -620,6 +622,37 @@ def SVD(
     return per_feature_mean, U, S, Vh
 
 
+def run_svd_job(
+    tensor_manager: TensorFileManager,
+    worker: str,
+    kv: TensorFileManager.KV,
+    svd_dim: int,
+    svd_iter: int,
+    N: int,
+):
+    mu, U, S, V = SVD(
+        tensor_manager,
+        svd_dim,
+        svd_iter,
+        kv,
+        N,
+        undo_rope=kv == TensorFileManager.KV.K,
+    )
+    logger.info(
+        "%s/%s: mu=%s U=%s S=%s V=%s",
+        worker,
+        kv,
+        mu.shape,
+        U.shape,
+        S.shape,
+        V.shape,
+    )
+
+    # U and S are not part of the calibration output. Do not retain them in the
+    # Future result because U can be large.
+    return worker, kv, mu, V
+
+
 def init_logger(log_dir, filename, log_level):
     levels = {
         "critical": logging.CRITICAL,
@@ -768,8 +801,6 @@ def run():
     log_level = args.log_level
     sampling_policy = TensorFileManager.SamplingPolicy[args.sampling_policy.upper()]
 
-    Rope.load_model_config(args.model_dir)
-
     init_logger(
         log_dir,
         f"svd-q{svd_dim}_iter{svd_iter}_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log",
@@ -777,6 +808,16 @@ def run():
     )
 
     input_dir_list, workers = discover_dump_directories(input_dir)
+    svd_workers = min(SVD_WORKERS, len(workers) * len(TensorFileManager.KV))
+
+    available_cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    torch.set_num_threads(available_cpus)
+
+    Rope.load_model_config(args.model_dir)
 
     output_dict = {
         "version": KVTC_FILE_VERSION,
@@ -787,28 +828,47 @@ def run():
     logger.info(
         f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
     )
+    logger.info(
+        "Running up to %d SVD jobs concurrently with up to %d PyTorch intra-op threads",
+        svd_workers,
+        available_cpus,
+    )
 
-    for worker in workers:
-        tensor_manager = TensorFileManager(input_dir_list, worker, sampling_policy)
-        for kv in TensorFileManager.KV:
-            undo_rope = kv == TensorFileManager.KV.K
-            try:
-                mu, U, S, V = SVD(
-                    tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
-                )
-                logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
-                if kv == TensorFileManager.KV.K:
-                    output_dict["keys"][worker]["basis"] = V
-                    output_dict["keys"][worker]["mu"] = mu
-                elif kv == TensorFileManager.KV.V:
-                    output_dict["values"][worker]["basis"] = V
-                    output_dict["values"][worker]["mu"] = mu
+    tensor_managers = {
+        worker: TensorFileManager(input_dir_list, worker, sampling_policy)
+        for worker in workers
+    }
 
-            except RuntimeError as e:
-                logger.exception('')
-                return
+    with ThreadPoolExecutor(
+        max_workers=svd_workers, thread_name_prefix="svd"
+    ) as executor:
+        futures = [
+            executor.submit(
+                run_svd_job,
+                tensor_managers[worker],
+                worker,
+                kv,
+                svd_dim,
+                svd_iter,
+                N,
+            )
+            for worker in workers
+            for kv in TensorFileManager.KV
+        ]
 
-        torch.save(output_dict, output_path)
+        try:
+            for future in as_completed(futures):
+                worker, kv, mu, basis = future.result()
+                section = "keys" if kv == TensorFileManager.KV.K else "values"
+                output_dict[section][worker]["mu"] = mu
+                output_dict[section][worker]["basis"] = basis
+        except Exception:
+            for future in futures:
+                future.cancel()
+            logger.exception("SVD calibration failed")
+            raise
+
+    torch.save(output_dict, output_path)
 
 
 if __name__ == "__main__":
