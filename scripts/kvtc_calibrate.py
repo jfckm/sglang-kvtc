@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import random
 import os
 import math
@@ -9,10 +10,11 @@ import torch
 import pprint
 import logging
 import sys
+import threading
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.append("../python")
 from sglang.srt.mem_cache.allocator import token
@@ -30,7 +32,275 @@ from enum import Enum, IntEnum
 logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 KVTC_FILE_VERSION="v1-noquant"
+TOKEN_SELECTION_FILE_VERSION = 1
+SINK_TOKENS = 128
 SVD_WORKERS = 4
+
+
+class TokenSelectionError(ValueError):
+    pass
+
+
+class TokenSelectionStore:
+    """Record or replay token positions selected from KV dump requests."""
+
+    def __init__(
+        self,
+        *,
+        mode,
+        path,
+        input_dir,
+        model_dir,
+        sample_tokens,
+        sampling_policy,
+        dump_directories,
+        workers,
+    ):
+        if mode not in (None, "load", "save"):
+            raise TokenSelectionError(f"Invalid token selection mode: {mode}")
+        self.mode = mode
+        self.path = path
+        self.input_dir = input_dir.absolute()
+        self.metadata = None
+        self._lock = threading.Lock()
+        self._selections = {}
+        self._used_selections = set()
+
+        if self.mode is not None:
+            self.metadata = {
+                "kvtc_version": KVTC_FILE_VERSION,
+                "model_dir": str(model_dir.resolve()),
+                "sample_tokens": sample_tokens,
+                "sampling_policy": sampling_policy.name.lower(),
+                "dump_directories": [
+                    self._relative_path(path) for path in dump_directories
+                ],
+                "workers": workers,
+                "sink_tokens_per_side": SINK_TOKENS,
+            }
+        if self.mode == "load":
+            self._load()
+
+    def _relative_path(self, path):
+        try:
+            return path.absolute().relative_to(self.input_dir).as_posix()
+        except ValueError as error:
+            raise TokenSelectionError(
+                f"Selection source {path} is outside input directory {self.input_dir}"
+            ) from error
+
+    def _selection_key(self, worker, kv, dataset_path, request_id):
+        return (
+            worker,
+            kv.name,
+            self._relative_path(dataset_path),
+            request_id,
+        )
+
+    def _load(self):
+        try:
+            with self.path.open(encoding="utf-8") as file:
+                document = json.load(file)
+        except FileNotFoundError as error:
+            raise TokenSelectionError(
+                f"Token selection file does not exist: {self.path}"
+            ) from error
+        except (OSError, json.JSONDecodeError) as error:
+            raise TokenSelectionError(
+                f"Cannot load token selection file {self.path}: {error}"
+            ) from error
+
+        if not isinstance(document, dict):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} must contain a JSON object"
+            )
+        if document.get("version") != TOKEN_SELECTION_FILE_VERSION:
+            raise TokenSelectionError(
+                f"Unsupported token selection file version in {self.path}: "
+                f"{document.get('version')!r}; expected {TOKEN_SELECTION_FILE_VERSION}"
+            )
+
+        saved_metadata = document.get("metadata")
+        if not isinstance(saved_metadata, dict):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} has no valid metadata object"
+            )
+        if saved_metadata != self.metadata:
+            differing_fields = sorted(
+                key
+                for key in set(saved_metadata) | set(self.metadata)
+                if saved_metadata.get(key) != self.metadata.get(key)
+            )
+            raise TokenSelectionError(
+                f"Token selection file {self.path} is incompatible with this run; "
+                f"different metadata fields: {', '.join(differing_fields)}"
+            )
+
+        selections = document.get("selections")
+        if not isinstance(selections, list):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} has no valid selections list"
+            )
+
+        for selection in selections:
+            try:
+                key = (
+                    selection["worker"],
+                    selection["kv"],
+                    selection["dump_directory"],
+                    selection["request_id"],
+                )
+            except (KeyError, TypeError) as error:
+                raise TokenSelectionError(
+                    f"Malformed selection entry in {self.path}: {selection!r}"
+                ) from error
+            if key in self._selections:
+                raise TokenSelectionError(
+                    f"Duplicate selection entry in {self.path}: {key}"
+                )
+            self._selections[key] = selection
+
+        logger.info(
+            "Loaded %d token selections from %s", len(self._selections), self.path
+        )
+
+    def select(
+        self,
+        *,
+        worker,
+        kv,
+        dataset_path,
+        request_id,
+        source_paths,
+        token_count,
+        sampling_budget,
+    ):
+        if self.mode is None:
+            return sorted(
+                random.sample(
+                    range(SINK_TOKENS, token_count - SINK_TOKENS), sampling_budget
+                )
+            )
+
+        key = self._selection_key(worker, kv, dataset_path, request_id)
+        relative_sources = [self._relative_path(path) for path in source_paths]
+
+        if self.mode == "load":
+            with self._lock:
+                selection = self._selections.get(key)
+                if selection is None:
+                    raise TokenSelectionError(
+                        "No saved token selection for "
+                        f"worker={worker}, kv={kv.name}, dump={key[2]}, "
+                        f"request={request_id}"
+                    )
+                if key in self._used_selections:
+                    raise TokenSelectionError(
+                        f"Token selection was requested more than once: {key}"
+                    )
+                self._used_selections.add(key)
+
+            expected = {
+                "source_files": relative_sources,
+                "token_count": token_count,
+                "sampling_budget": sampling_budget,
+            }
+            differing_fields = [
+                field
+                for field, value in expected.items()
+                if selection.get(field) != value
+            ]
+            if differing_fields:
+                raise TokenSelectionError(
+                    f"Saved selection for {key} does not match the current dump; "
+                    f"different fields: {', '.join(differing_fields)}"
+                )
+
+            indices = selection.get("selected_token_indices")
+            if (
+                not isinstance(indices, list)
+                or len(indices) != sampling_budget
+                or any(type(index) is not int for index in indices)
+                or indices != sorted(set(indices))
+                or any(
+                    index < SINK_TOKENS or index >= token_count - SINK_TOKENS
+                    for index in indices
+                )
+            ):
+                raise TokenSelectionError(
+                    f"Saved selection for {key} contains invalid token indices"
+                )
+            return indices
+
+        indices = sorted(
+            random.sample(
+                range(SINK_TOKENS, token_count - SINK_TOKENS), sampling_budget
+            )
+        )
+        if self.mode == "save":
+            selection = {
+                "worker": worker,
+                "kv": kv.name,
+                "dump_directory": key[2],
+                "request_id": request_id,
+                "source_files": relative_sources,
+                "token_count": token_count,
+                "sampling_budget": sampling_budget,
+                "selected_token_indices": indices,
+            }
+            with self._lock:
+                if key in self._selections:
+                    raise TokenSelectionError(
+                        f"Duplicate token selection generated for {key}"
+                    )
+                self._selections[key] = selection
+        return indices
+
+    def finalize(self):
+        if self.mode == "load":
+            unused = set(self._selections) - self._used_selections
+            if unused:
+                examples = sorted(unused)[:3]
+                raise TokenSelectionError(
+                    f"Token selection file {self.path} contains {len(unused)} "
+                    f"unused selections, including: {examples}"
+                )
+            logger.info("Reused all token selections from %s", self.path)
+            return
+
+        if self.mode != "save":
+            return
+
+        document = {
+            "version": TOKEN_SELECTION_FILE_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": self.metadata,
+            "selections": sorted(
+                self._selections.values(),
+                key=lambda selection: (
+                    selection["worker"],
+                    selection["kv"],
+                    selection["dump_directory"],
+                    selection["request_id"],
+                ),
+            ),
+        }
+        temporary_path = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(document, file, indent=2)
+                file.write("\n")
+            os.replace(temporary_path, self.path)
+        except OSError as error:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise TokenSelectionError(
+                f"Cannot save token selections to {self.path}: {error}"
+            ) from error
+        logger.info("Saved %d token selections to %s", len(self._selections), self.path)
 
 
 class Rope(object):
@@ -291,16 +561,8 @@ def load_tensor(paths):
     return ret, ret.shape[0]
 
 
-def trim_sink_tokens(tensor):
-    return tensor[128:-128]
-
-
-def sample_tokens(tensor, sampling_budget):
-    token_cnt = tensor.shape[0]
-    ids = random.sample(list(range(token_cnt)), sampling_budget)
-    ids.sort()
-
-    ids = torch.Tensor(ids).to(device="cpu").int()
+def sample_tokens(tensor, token_indices):
+    ids = torch.tensor(token_indices, device="cpu", dtype=torch.long)
     logger.debug(f"Sample ids\n{ids}")
 
     ret = tensor[ids, :].to(dtype=torch.float32, copy=True)
@@ -466,7 +728,7 @@ class TensorFileManager(object):
 
     def get_token_budget(self, kv: KV, dataset_name, N, tensor):
         token_cnt = tensor.shape[0]
-        sink_tokens = 256
+        sink_tokens = 2 * SINK_TOKENS
 
         if self.sampling_policy == TensorFileManager.SamplingPolicy.STRICT:
             assert token_cnt >= 1000
@@ -551,6 +813,8 @@ class TensorFileManager(object):
 
 def SVD(
     tensor_manager: TensorFileManager,
+    selection_store: TokenSelectionStore,
+    worker: str,
     svd_dim: int,
     svd_iter: int,
     kv: TensorFileManager.KV,
@@ -586,7 +850,7 @@ def SVD(
                 sampling_budget = tensor_manager.get_token_budget(
                     kv, kv_cache_paths, N, tensor
                 )
-                if sampling_budget >= token_count - 2 * 128:
+                if sampling_budget >= token_count - 2 * SINK_TOKENS:
                     raise ValueError(
                         f"sampling budget {sampling_budget} leaves no non-sink tokens "
                         f"in {token_count}-token request"
@@ -594,8 +858,19 @@ def SVD(
 
                 if undo_rope:
                     tensor = Rope.invert_rope(tensor)
-                tensor = trim_sink_tokens(tensor)
-                sampled_data.append(sample_tokens(tensor, sampling_budget))
+                request_id = paths[0].name.split(kv.value, 1)[0]
+                token_indices = selection_store.select(
+                    worker=worker,
+                    kv=kv,
+                    dataset_path=kv_cache_paths,
+                    request_id=request_id,
+                    source_paths=paths,
+                    token_count=token_count,
+                    sampling_budget=sampling_budget,
+                )
+                sampled_data.append(sample_tokens(tensor, token_indices))
+            except TokenSelectionError:
+                raise
             except (AssertionError, RuntimeError, ValueError) as error:
                 logger.warning("Skipping %s: %s", paths[0], error)
 
@@ -624,6 +899,7 @@ def SVD(
 
 def run_svd_job(
     tensor_manager: TensorFileManager,
+    selection_store: TokenSelectionStore,
     worker: str,
     kv: TensorFileManager.KV,
     svd_dim: int,
@@ -632,6 +908,8 @@ def run_svd_job(
 ):
     mu, U, S, V = SVD(
         tensor_manager,
+        selection_store,
+        worker,
         svd_dim,
         svd_iter,
         kv,
@@ -736,7 +1014,9 @@ def run():
             " -N <token_sample_count> --niter <the number of subspace iterations for svd_lowrank>"
             " -q <a slightly overestimated rank of svd matrix>"
             " -i <dump-parent-directory>"
-            " -o <output_path> -m <model_path>\n"
+            " -o <output_path> -m <model_path>"
+            " [--save-selected-tokens <path> | --load-selected-tokens <path> |"
+            " --selected-tokens-cache <path>]\n"
         )
     )
     parser.add_argument(
@@ -789,6 +1069,25 @@ def run():
         default="strict",
         choices=list(str(p.name).lower() for p in TensorFileManager.SamplingPolicy),
     )
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
+        "--save-selected-tokens",
+        metavar="PATH",
+        help="Save the token positions selected during this run as JSON",
+    )
+    selection_group.add_argument(
+        "--load-selected-tokens",
+        metavar="PATH",
+        help="Load and reuse token positions from a previous run",
+    )
+    selection_group.add_argument(
+        "--selected-tokens-cache",
+        metavar="PATH",
+        help=(
+            "Load token positions when PATH exists; otherwise select tokens and "
+            "save them to PATH"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -809,6 +1108,40 @@ def run():
 
     input_dir_list, workers = discover_dump_directories(input_dir)
     svd_workers = min(SVD_WORKERS, len(workers) * len(TensorFileManager.KV))
+
+    selection_mode = None
+    selection_path = None
+    if args.save_selected_tokens:
+        selection_mode = "save"
+        selection_path = Path(args.save_selected_tokens)
+    elif args.load_selected_tokens:
+        selection_mode = "load"
+        selection_path = Path(args.load_selected_tokens)
+    elif args.selected_tokens_cache:
+        selection_path = Path(args.selected_tokens_cache)
+        selection_mode = "load" if selection_path.exists() else "save"
+        logger.info(
+            "Token selection cache %s; %s selections at %s",
+            "exists" if selection_mode == "load" else "does not exist",
+            "loading" if selection_mode == "load" else "saving new",
+            selection_path,
+        )
+    if (
+        selection_path is not None
+        and selection_path.absolute() == output_path.absolute()
+    ):
+        parser.error("The token selection path must differ from --output")
+
+    selection_store = TokenSelectionStore(
+        mode=selection_mode,
+        path=selection_path,
+        input_dir=input_dir,
+        model_dir=Path(args.model_dir),
+        sample_tokens=N,
+        sampling_policy=sampling_policy,
+        dump_directories=input_dir_list,
+        workers=workers,
+    )
 
     available_cpus = (
         len(os.sched_getaffinity(0))
@@ -846,6 +1179,7 @@ def run():
             executor.submit(
                 run_svd_job,
                 tensor_managers[worker],
+                selection_store,
                 worker,
                 kv,
                 svd_dim,
@@ -868,6 +1202,7 @@ def run():
             logger.exception("SVD calibration failed")
             raise
 
+    selection_store.finalize()
     torch.save(output_dict, output_path)
 
 
