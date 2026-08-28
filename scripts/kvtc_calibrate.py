@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import random
 import os
@@ -32,11 +33,23 @@ logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 KVTC_FILE_VERSION="v1-noquant"
 TOKEN_SELECTION_FILE_VERSION = 2
+SVD_ARTIFACT_FILE_VERSION = 1
 SINK_TOKENS = 128
 SVD_WORKERS = 4
 
 
+def stable_digest(value):
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class TokenSelectionError(ValueError):
+    pass
+
+
+class SVDArtifactError(ValueError):
     pass
 
 
@@ -60,23 +73,21 @@ class TokenSelectionStore:
         self.mode = mode
         self.path = path
         self.input_dir = input_dir.absolute()
-        self.metadata = None
         self._selections = {}
         self._loaded_selections = None
         self._finalized = False
 
-        if self.mode is not None:
-            self.metadata = {
-                "kvtc_version": KVTC_FILE_VERSION,
-                "model_dir": str(model_dir.resolve()),
-                "sample_tokens": sample_tokens,
-                "sampling_policy": sampling_policy.name.lower(),
-                "dump_directories": [
-                    self._relative_path(path) for path in dump_directories
-                ],
-                "workers": workers,
-                "sink_tokens_per_side": SINK_TOKENS,
-            }
+        self.metadata = {
+            "kvtc_version": KVTC_FILE_VERSION,
+            "model_dir": str(model_dir.resolve()),
+            "sample_tokens": sample_tokens,
+            "sampling_policy": sampling_policy.name.lower(),
+            "dump_directories": [
+                self._relative_path(path) for path in dump_directories
+            ],
+            "workers": workers,
+            "sink_tokens_per_side": SINK_TOKENS,
+        }
         if self.mode == "load":
             self._load()
 
@@ -298,6 +309,25 @@ class TokenSelectionStore:
                 f"{selection['token_count']}, got {token_count}"
             )
         return selection["selected_token_indices"]
+
+    def identity(self):
+        if not self._finalized:
+            raise TokenSelectionError(
+                "Token selections were not finalized before computing their identity"
+            )
+        return {
+            "metadata": self.metadata,
+            "selections": sorted(
+                self._selections.values(),
+                key=lambda selection: (
+                    selection["dump_directory"],
+                    selection["request_id"],
+                ),
+            ),
+        }
+
+    def digest(self):
+        return stable_digest(self.identity())
 
 
 class Rope(object):
@@ -892,6 +922,233 @@ def build_global_sampling_requests(tensor_managers, workers, sample_tokens):
     return requests
 
 
+def build_svd_cache_metadata(
+    *,
+    input_dir,
+    model_dir,
+    dump_directories,
+    workers,
+    sampling_requests,
+    sample_tokens,
+    sampling_policy,
+    svd_dim,
+    svd_iter,
+):
+    input_dir = input_dir.absolute()
+    return {
+        "artifact_version": SVD_ARTIFACT_FILE_VERSION,
+        "kvtc_version": KVTC_FILE_VERSION,
+        "input_dir": str(input_dir),
+        "model_dir": str(model_dir.resolve()),
+        "dump_directories": [
+            path.absolute().relative_to(input_dir).as_posix()
+            for path in dump_directories
+        ],
+        "workers": list(workers),
+        "sample_tokens": sample_tokens,
+        "sampling_policy": sampling_policy.name.lower(),
+        "sink_tokens_per_side": SINK_TOKENS,
+        "sampling_requests_digest": stable_digest(
+            [
+                {
+                    "dump_directory": request["dataset_path"]
+                    .absolute()
+                    .relative_to(input_dir)
+                    .as_posix(),
+                    "request_id": request["request_id"],
+                    "token_count": request["token_count"],
+                    "sampling_budget": request["sampling_budget"],
+                }
+                for request in sampling_requests
+            ]
+        ),
+        "svd_dim": svd_dim,
+        "svd_iter": svd_iter,
+    }
+
+
+def build_svd_cache_directory(output_path, cache_metadata):
+    configuration_digest = stable_digest(cache_metadata)
+    run_name = (
+        f"kvtc-{KVTC_FILE_VERSION}"
+        f"_N-{cache_metadata['sample_tokens']}"
+        f"_policy-{cache_metadata['sampling_policy']}"
+        f"_q-{cache_metadata['svd_dim']}"
+        f"_niter-{cache_metadata['svd_iter']}"
+        f"_{configuration_digest}"
+    )
+    return output_path.with_name(f"{output_path.name}.svd-artifacts") / run_name
+
+
+def build_svd_job_metadata(cache_metadata, selection_digest, worker, kv):
+    match = WORKER_DIR_PATTERN.fullmatch(worker)
+    if match is None:
+        raise SVDArtifactError(f"Invalid worker name for SVD artifact: {worker}")
+    tp_rank, pp_rank = map(int, match.groups())
+    return {
+        **cache_metadata,
+        "token_selection_digest": selection_digest,
+        "worker": worker,
+        "tp_rank": tp_rank,
+        "pp_rank": pp_rank,
+        "kv": kv.name,
+        "undo_rope": kv == TensorFileManager.KV.K,
+    }
+
+
+def save_svd_artifact(path, temporary_path, metadata, mu, basis):
+    document = {
+        "version": SVD_ARTIFACT_FILE_VERSION,
+        "metadata": metadata,
+        "mu": mu,
+        "basis": basis,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(document, temporary_path)
+        os.replace(temporary_path, path)
+    except Exception as error:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SVDArtifactError(f"Cannot save SVD artifact {path}: {error}") from error
+
+
+def load_svd_artifact(path, expected_metadata):
+    try:
+        document = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise SVDArtifactError(f"Cannot load SVD artifact {path}: {error}") from error
+
+    if not isinstance(document, dict):
+        raise SVDArtifactError(f"SVD artifact {path} must contain a dictionary")
+    if document.get("version") != SVD_ARTIFACT_FILE_VERSION:
+        raise SVDArtifactError(
+            f"Unsupported SVD artifact version in {path}: "
+            f"{document.get('version')!r}; expected {SVD_ARTIFACT_FILE_VERSION}"
+        )
+
+    metadata = document.get("metadata")
+    if metadata != expected_metadata:
+        if not isinstance(metadata, dict):
+            differing_fields = ["metadata"]
+        else:
+            differing_fields = sorted(
+                key
+                for key in set(metadata) | set(expected_metadata)
+                if metadata.get(key) != expected_metadata.get(key)
+            )
+        raise SVDArtifactError(
+            f"SVD artifact {path} is incompatible with its expected final index; "
+            f"different metadata fields: {', '.join(differing_fields)}"
+        )
+
+    mu = document.get("mu")
+    basis = document.get("basis")
+    if not isinstance(mu, torch.Tensor) or not isinstance(basis, torch.Tensor):
+        raise SVDArtifactError(f"SVD artifact {path} has no valid mu/basis tensors")
+    if mu.device.type != "cpu" or basis.device.type != "cpu":
+        raise SVDArtifactError(f"SVD artifact {path} did not load on CPU")
+    if mu.dtype != torch.float32 or basis.dtype != torch.float32:
+        raise SVDArtifactError(
+            f"SVD artifact {path} has dtype mu={mu.dtype}, basis={basis.dtype}; "
+            "expected torch.float32"
+        )
+    expected_basis_shape = (mu.numel(), expected_metadata["svd_dim"])
+    if mu.ndim != 1 or tuple(basis.shape) != expected_basis_shape:
+        raise SVDArtifactError(
+            f"SVD artifact {path} has shapes mu={tuple(mu.shape)}, "
+            f"basis={tuple(basis.shape)}; expected one-dimensional mu and "
+            f"basis={expected_basis_shape}"
+        )
+    return mu, basis
+
+
+def assemble_svd_output(workers, jobs):
+    expected_pairs = {
+        (worker, kv) for worker in workers for kv in TensorFileManager.KV
+    }
+    actual_pairs = set(jobs)
+    if actual_pairs != expected_pairs:
+        missing = sorted(expected_pairs - actual_pairs, key=lambda pair: str(pair))
+        extra = sorted(actual_pairs - expected_pairs, key=lambda pair: str(pair))
+        raise SVDArtifactError(
+            f"SVD artifact index is incomplete: missing={missing}, extra={extra}"
+        )
+
+    output_dict = {
+        "version": KVTC_FILE_VERSION,
+        "keys": {worker: {"mu": None, "basis": None} for worker in workers},
+        "values": {worker: {"mu": None, "basis": None} for worker in workers},
+    }
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            job = jobs[(worker, kv)]
+            mu, basis = load_svd_artifact(job["path"], job["metadata"])
+            section = "keys" if kv == TensorFileManager.KV.K else "values"
+            output_dict[section][worker]["mu"] = mu
+            output_dict[section][worker]["basis"] = basis
+            logger.info(
+                "Assigned SVD artifact %s to final index %s/%s",
+                job["path"],
+                section,
+                worker,
+            )
+
+    for section in ("keys", "values"):
+        for worker in workers:
+            if any(
+                output_dict[section][worker][name] is None
+                for name in ("mu", "basis")
+            ):
+                raise SVDArtifactError(
+                    f"Final SVD output index {section}/{worker} was not populated"
+                )
+    return output_dict
+
+
+def select_svd_jobs(workers, jobs, cache_policy):
+    if cache_policy not in ("reuse", "overwrite"):
+        raise SVDArtifactError(f"Invalid SVD cache policy: {cache_policy}")
+
+    jobs_to_run = []
+    reused_jobs = 0
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            job = jobs[(worker, kv)]
+            artifact_path = job["path"]
+            if artifact_path.exists() and not artifact_path.is_file():
+                raise SVDArtifactError(
+                    f"SVD artifact path exists but is not a file: {artifact_path}"
+                )
+            if cache_policy == "reuse" and artifact_path.is_file():
+                logger.info(
+                    "Skipping SVD for worker=%s kv=%s: artifact already exists at %s",
+                    worker,
+                    kv.name,
+                    artifact_path,
+                )
+                reused_jobs += 1
+                continue
+            if artifact_path.is_file():
+                logger.info(
+                    "Overwriting SVD artifact for worker=%s kv=%s at %s",
+                    worker,
+                    kv.name,
+                    artifact_path,
+                )
+            jobs_to_run.append((worker, kv, job))
+
+    logger.info(
+        "SVD jobs: %d reused, %d scheduled, %d total",
+        reused_jobs,
+        len(jobs_to_run),
+        len(jobs),
+    )
+    return jobs_to_run
+
+
 def SVD(
     tensor_manager: TensorFileManager,
     selection_store: TokenSelectionStore,
@@ -968,6 +1225,9 @@ def run_svd_job(
     kv: TensorFileManager.KV,
     svd_dim: int,
     svd_iter: int,
+    artifact_path: Path,
+    artifact_temporary_path: Path,
+    artifact_metadata: dict,
 ):
     mu, U, S, V = SVD(
         tensor_manager,
@@ -987,9 +1247,22 @@ def run_svd_job(
         V.shape,
     )
 
-    # U and S are not part of the calibration output. Do not retain them in the
-    # Future result because U can be large.
-    return worker, kv, mu, V
+    # U and S are not part of the calibration output and can be large. Release
+    # them before persisting the tensors that are needed by the final object.
+    del U, S
+    save_svd_artifact(
+        artifact_path, artifact_temporary_path, artifact_metadata, mu, V
+    )
+    logger.info(
+        "Saved SVD artifact for worker=%s kv=%s at %s",
+        worker,
+        kv.name,
+        artifact_path,
+    )
+
+    # Futures must never retain output tensors while other SVD jobs are running.
+    del mu, V
+    return worker, kv, artifact_path
 
 
 def init_logger(log_dir, filename, log_level):
@@ -1068,7 +1341,7 @@ def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
     return dump_dirs, workers
 
 
-def run():
+def create_argument_parser():
     parser = argparse.ArgumentParser(
         usage=(
             f"\n{os.path.basename(__file__)}"
@@ -1076,6 +1349,7 @@ def run():
             " -q <a slightly overestimated rank of svd matrix>"
             " -i <dump-parent-directory>"
             " -o <output_path> -m <model_path>"
+            " --svd-cache-policy <reuse|overwrite>"
             " [--save-selected-tokens <path> | --load-selected-tokens <path> |"
             " --selected-tokens-cache <path>]\n"
         )
@@ -1130,6 +1404,16 @@ def run():
         default="strict",
         choices=list(str(p.name).lower() for p in TensorFileManager.SamplingPolicy),
     )
+    parser.add_argument(
+        "--svd-cache-policy",
+        required=True,
+        choices=("reuse", "overwrite"),
+        help=(
+            "Reuse existing compatible per-worker SVD artifacts and calculate only "
+            "missing jobs, or overwrite all artifacts for this run. Artifacts are "
+            "stored under <output>.svd-artifacts"
+        ),
+    )
     selection_group = parser.add_mutually_exclusive_group()
     selection_group.add_argument(
         "--save-selected-tokens",
@@ -1149,6 +1433,11 @@ def run():
             "and save them to PATH"
         ),
     )
+    return parser
+
+
+def run():
+    parser = create_argument_parser()
 
     args = parser.parse_args()
 
@@ -1170,40 +1459,6 @@ def run():
     input_dir_list, workers = discover_dump_directories(input_dir)
     svd_workers = min(SVD_WORKERS, len(workers) * len(TensorFileManager.KV))
 
-    selection_mode = None
-    selection_path = None
-    if args.save_selected_tokens:
-        selection_mode = "save"
-        selection_path = Path(args.save_selected_tokens)
-    elif args.load_selected_tokens:
-        selection_mode = "load"
-        selection_path = Path(args.load_selected_tokens)
-    elif args.selected_tokens_cache:
-        selection_path = Path(args.selected_tokens_cache)
-        selection_mode = "load" if selection_path.exists() else "save"
-        logger.info(
-            "Token selection cache %s; %s selections at %s",
-            "exists" if selection_mode == "load" else "does not exist",
-            "loading" if selection_mode == "load" else "saving new",
-            selection_path,
-        )
-    if (
-        selection_path is not None
-        and selection_path.absolute() == output_path.absolute()
-    ):
-        parser.error("The token selection path must differ from --output")
-
-    selection_store = TokenSelectionStore(
-        mode=selection_mode,
-        path=selection_path,
-        input_dir=input_dir,
-        model_dir=Path(args.model_dir),
-        sample_tokens=N,
-        sampling_policy=sampling_policy,
-        dump_directories=input_dir_list,
-        workers=workers,
-    )
-
     available_cpus = (
         len(os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity")
@@ -1218,16 +1473,85 @@ def run():
     global_sampling_requests = build_global_sampling_requests(
         tensor_managers, workers, N
     )
+
+    cache_metadata = build_svd_cache_metadata(
+        input_dir=input_dir,
+        model_dir=Path(args.model_dir),
+        dump_directories=input_dir_list,
+        workers=workers,
+        sampling_requests=global_sampling_requests,
+        sample_tokens=N,
+        sampling_policy=sampling_policy,
+        svd_dim=svd_dim,
+        svd_iter=svd_iter,
+    )
+    svd_cache_directory = build_svd_cache_directory(output_path, cache_metadata)
+
+    selection_mode = None
+    selection_path = None
+    if args.save_selected_tokens:
+        selection_mode = "save"
+        selection_path = Path(args.save_selected_tokens)
+    elif args.load_selected_tokens:
+        selection_mode = "load"
+        selection_path = Path(args.load_selected_tokens)
+    elif args.selected_tokens_cache:
+        selection_path = Path(args.selected_tokens_cache)
+        selection_mode = "load" if selection_path.exists() else "save"
+    else:
+        selection_path = svd_cache_directory / "selected-tokens.json"
+        selection_mode = "load" if selection_path.exists() else "save"
+
+    logger.info(
+        "Token selection cache %s; %s selections at %s",
+        "exists" if selection_path.exists() else "does not exist",
+        "loading" if selection_mode == "load" else "saving new",
+        selection_path,
+    )
+    if selection_path.absolute() == output_path.absolute():
+        parser.error("The token selection path must differ from --output")
+
+    selection_store = TokenSelectionStore(
+        mode=selection_mode,
+        path=selection_path,
+        input_dir=input_dir,
+        model_dir=Path(args.model_dir),
+        sample_tokens=N,
+        sampling_policy=sampling_policy,
+        dump_directories=input_dir_list,
+        workers=workers,
+    )
     # Keep selection finalization and persistence ahead of all SVD worker creation.
     selection_store.finalize(global_sampling_requests)
+    selection_digest = selection_store.digest()
+    artifact_directory = svd_cache_directory / f"selection-{selection_digest}"
+    logger.info(
+        "SVD artifact directory for current sampling/SVD parameters: %s",
+        artifact_directory,
+    )
 
     Rope.load_model_config(args.model_dir)
 
-    output_dict = {
-        "version": KVTC_FILE_VERSION,
-        "keys": {worker: {"mu": None, "basis": None} for worker in workers},
-        "values": {worker: {"mu": None, "basis": None} for worker in workers},
-    }
+    # This is the authoritative mapping between an SVD artifact and its final
+    # output index. Never infer this mapping from completion or directory order.
+    jobs = {}
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            pair = (worker, kv)
+            metadata = build_svd_job_metadata(
+                cache_metadata, selection_digest, worker, kv
+            )
+            artifact_path = artifact_directory / f"{worker}-{kv.name}.pt"
+            temporary_path = artifact_path.with_name(
+                f".{artifact_path.name}.tmp-{os.getpid()}"
+            )
+            if pair in jobs:
+                raise SVDArtifactError(f"Duplicate SVD job index: {pair}")
+            jobs[pair] = {
+                "path": artifact_path,
+                "temporary_path": temporary_path,
+                "metadata": metadata,
+            }
 
     logger.info(
         f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
@@ -1238,35 +1562,66 @@ def run():
         available_cpus,
     )
 
-    with ThreadPoolExecutor(
-        max_workers=svd_workers, thread_name_prefix="svd"
-    ) as executor:
-        futures = [
-            executor.submit(
-                run_svd_job,
-                tensor_managers[worker],
-                selection_store,
-                worker,
-                kv,
-                svd_dim,
-                svd_iter,
-            )
-            for worker in workers
-            for kv in TensorFileManager.KV
-        ]
+    jobs_to_run = select_svd_jobs(workers, jobs, args.svd_cache_policy)
 
-        try:
-            for future in as_completed(futures):
-                worker, kv, mu, basis = future.result()
-                section = "keys" if kv == TensorFileManager.KV.K else "values"
-                output_dict[section][worker]["mu"] = mu
-                output_dict[section][worker]["basis"] = basis
-        except Exception:
-            for future in futures:
-                future.cancel()
-            logger.exception("SVD calibration failed")
-            raise
+    if jobs_to_run:
+        with ThreadPoolExecutor(
+            max_workers=svd_workers, thread_name_prefix="svd"
+        ) as executor:
+            future_jobs = {
+                executor.submit(
+                    run_svd_job,
+                    tensor_managers[worker],
+                    selection_store,
+                    worker,
+                    kv,
+                    svd_dim,
+                    svd_iter,
+                    job["path"],
+                    job["temporary_path"],
+                    job["metadata"],
+                ): (worker, kv, job["path"])
+                for worker, kv, job in jobs_to_run
+            }
 
+            completed_jobs = 0
+            try:
+                for future in as_completed(future_jobs):
+                    expected_worker, expected_kv, expected_path = future_jobs[future]
+                    worker, kv, artifact_path = future.result()
+                    if (
+                        worker != expected_worker
+                        or kv != expected_kv
+                        or artifact_path != expected_path
+                    ):
+                        raise SVDArtifactError(
+                            "SVD future returned a result for the wrong final index: "
+                            f"expected {(expected_worker, expected_kv, expected_path)}, "
+                            f"got {(worker, kv, artifact_path)}"
+                        )
+                    completed_jobs += 1
+            except Exception:
+                for future in future_jobs:
+                    future.cancel()
+                logger.exception(
+                    "SVD calibration failed after confirming %d of %d scheduled "
+                    "artifacts; rerun with --svd-cache-policy reuse to resume",
+                    completed_jobs,
+                    len(jobs_to_run),
+                )
+                raise
+
+    missing_artifacts = [
+        job["path"] for job in jobs.values() if not job["path"].is_file()
+    ]
+    if missing_artifacts:
+        raise SVDArtifactError(
+            f"Cannot assemble final output; missing SVD artifacts: {missing_artifacts}"
+        )
+
+    # Load output matrices only after every SVD artifact has been published and
+    # all SVD scratch tensors have been released.
+    output_dict = assemble_svd_output(workers, jobs)
     torch.save(output_dict, output_path)
 
 
