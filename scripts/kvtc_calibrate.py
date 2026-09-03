@@ -130,15 +130,16 @@ class TokenSelectionStore:
             raise TokenSelectionError(
                 f"Token selection file {self.path} has no valid metadata object"
             )
-        if saved_metadata != self.metadata:
-            differing_fields = sorted(
-                key
-                for key in set(saved_metadata) | set(self.metadata)
-                if saved_metadata.get(key) != self.metadata.get(key)
-            )
+        saved_sample_tokens = saved_metadata.get("sample_tokens")
+        expected_sample_tokens = self.metadata["sample_tokens"]
+        if (
+            type(saved_sample_tokens) is not int
+            or saved_sample_tokens != expected_sample_tokens
+        ):
             raise TokenSelectionError(
                 f"Token selection file {self.path} is incompatible with this run; "
-                f"different metadata fields: {', '.join(differing_fields)}"
+                f"sample_tokens={saved_sample_tokens!r}, "
+                f"but current -N is {expected_sample_tokens}"
             )
 
         selections = document.get("selections")
@@ -1030,15 +1031,16 @@ def load_svd_artifact(path, expected_metadata):
         )
 
     metadata = document.get("metadata")
-    if metadata != expected_metadata:
-        if not isinstance(metadata, dict):
-            differing_fields = ["metadata"]
-        else:
-            differing_fields = sorted(
-                key
-                for key in set(metadata) | set(expected_metadata)
-                if metadata.get(key) != expected_metadata.get(key)
-            )
+    identity_fields = ("worker", "kv")
+    if not isinstance(metadata, dict):
+        differing_fields = ["metadata"]
+    else:
+        differing_fields = [
+            field
+            for field in identity_fields
+            if metadata.get(field) != expected_metadata.get(field)
+        ]
+    if differing_fields:
         raise SVDArtifactError(
             f"SVD artifact {path} is incompatible with its expected final index; "
             f"different metadata fields: {', '.join(differing_fields)}"
@@ -1054,13 +1056,6 @@ def load_svd_artifact(path, expected_metadata):
         raise SVDArtifactError(
             f"SVD artifact {path} has dtype mu={mu.dtype}, basis={basis.dtype}; "
             "expected torch.float32"
-        )
-    expected_basis_shape = (mu.numel(), expected_metadata["svd_dim"])
-    if mu.ndim != 1 or tuple(basis.shape) != expected_basis_shape:
-        raise SVDArtifactError(
-            f"SVD artifact {path} has shapes mu={tuple(mu.shape)}, "
-            f"basis={tuple(basis.shape)}; expected one-dimensional mu and "
-            f"basis={expected_basis_shape}"
         )
     return mu, basis
 
