@@ -311,6 +311,19 @@ class TokenSelectionStore:
             )
         return selection["selected_token_indices"]
 
+    def contains(self, dataset_path, request_id):
+        if not self._finalized:
+            raise TokenSelectionError("Token selections were not finalized before SVD")
+        return self._selection_key(dataset_path, request_id) in self._selections
+
+    def sample_count(self):
+        if not self._finalized:
+            raise TokenSelectionError("Token selections were not finalized before SVD")
+        return sum(
+            len(selection["selected_token_indices"])
+            for selection in self._selections.values()
+        )
+
     def identity(self):
         if not self._finalized:
             raise TokenSelectionError(
@@ -604,20 +617,13 @@ def transform_tensors(tensors):
         raise ValueError("No valid calibration tensors were loaded")
 
     feature_shapes = Counter(tensor.shape[1:] for tensor in tensors)
-    feature_shape, _ = feature_shapes.most_common(1)[0]
-    valid_tensors = [tensor for tensor in tensors if tensor.shape[1:] == feature_shape]
-    discarded = len(tensors) - len(valid_tensors)
-    if discarded:
-        logger.warning(
-            "Discarding %s sampled tensors with non-canonical feature shapes; "
-            "using %s from %s tensors",
-            discarded,
-            feature_shape,
-            len(valid_tensors),
+    if len(feature_shapes) != 1:
+        raise ValueError(
+            "Selected calibration tensors have different feature shapes: "
+            f"{dict(feature_shapes)}"
         )
-        logger.warning("Observed sampled feature shapes: %s", dict(feature_shapes))
 
-    ret = torch.concat(valid_tensors, dim=0).flatten(start_dim=1)
+    ret = torch.concat(tensors, dim=0).flatten(start_dim=1)
 
     torch.cpu.synchronize()
 
@@ -760,8 +766,25 @@ class TensorFileManager(object):
             for request_id, token_count in self.token_counts[dataset_path][kv].items()
         }
 
-    def get_token_budget(self, kv: KV, dataset_name, N, token_cnt):
+    def get_token_budget(
+        self, kv: KV, dataset_name, N, token_cnt, context_groups=None
+    ):
         sink_tokens = 2 * SINK_TOKENS
+
+        if context_groups is None:
+            def group_count(dataset, bucket):
+                return self.context_groups[dataset][kv][bucket]
+
+            datasets = self.datasets_list
+        else:
+            def group_count(dataset, bucket):
+                return context_groups[dataset][bucket]
+
+            datasets = [
+                dataset
+                for dataset in self.datasets_list
+                if sum(context_groups[dataset].values()) > 0
+            ]
 
         if self.sampling_policy == TensorFileManager.SamplingPolicy.STRICT:
             assert token_cnt >= 1000
@@ -773,8 +796,8 @@ class TensorFileManager(object):
             )
 
             nonempty_groups = sum(
-                self.context_groups[dataset][kv][bucket] > 0
-                for dataset in self.datasets_list
+                group_count(dataset, bucket) > 0
+                for dataset in datasets
                 for bucket in (
                     TensorFileManager.Sequence.SHORT,
                     TensorFileManager.Sequence.LONG,
@@ -783,7 +806,7 @@ class TensorFileManager(object):
             token_budget = math.ceil(
                 N
                 / nonempty_groups
-                / self.context_groups[dataset_name][kv][bucket]
+                / group_count(dataset_name, bucket)
             )
 
             if token_budget > token_cnt - sink_tokens:
@@ -799,11 +822,11 @@ class TensorFileManager(object):
             assert token_cnt >= 1000
             # Equal amount of tokens will be sampled from each dataset, but ignore short vs long contexts
 
-            dataset_token_budget = math.ceil(N / len(self.datasets_list))
+            dataset_token_budget = math.ceil(N / len(datasets))
 
             sequences_cnt = (
-                self.context_groups[dataset_name][kv][TensorFileManager.Sequence.SHORT]
-                + self.context_groups[dataset_name][kv][TensorFileManager.Sequence.LONG]
+                group_count(dataset_name, TensorFileManager.Sequence.SHORT)
+                + group_count(dataset_name, TensorFileManager.Sequence.LONG)
             )
 
             token_budget = math.ceil(dataset_token_budget / sequences_cnt)
@@ -821,13 +844,13 @@ class TensorFileManager(object):
 
             sequences_cnt = 0
 
-            for dataset in self.context_groups:
-                sequences_cnt += self.context_groups[dataset][kv][
-                    TensorFileManager.Sequence.SHORT
-                ]
-                sequences_cnt += self.context_groups[dataset][kv][
-                    TensorFileManager.Sequence.LONG
-                ]
+            for dataset in datasets:
+                sequences_cnt += group_count(
+                    dataset, TensorFileManager.Sequence.SHORT
+                )
+                sequences_cnt += group_count(
+                    dataset, TensorFileManager.Sequence.LONG
+                )
 
             token_budget = math.ceil(N / sequences_cnt)
 
@@ -844,8 +867,96 @@ class TensorFileManager(object):
             assert False, f"Invalid sampling policy {self.sampling_policy}"
 
 
+def validate_global_requests(tensor_managers, workers, usable_inventory):
+    """Return requests that reconstruct with one consistent shape in every job."""
+    request_keys = sorted(usable_inventory, key=lambda key: (str(key[0]), key[1]))
+    rejected = defaultdict(list)
+    shapes_by_job = {}
+
+    for worker in workers:
+        manager = tensor_managers[worker]
+        for kv in TensorFileManager.KV:
+            paths_by_request = {
+                (dataset_path, paths[0].name.split(kv.value, 1)[0]): paths
+                for dataset_path in manager.datasets_list
+                for paths in manager.datasets[dataset_path][kv]
+            }
+            request_shapes = {}
+            for key in request_keys:
+                paths = paths_by_request.get(key)
+                if paths is None:
+                    rejected[key].append(f"{worker}/{kv.name}: no usable dump files")
+                    continue
+                try:
+                    tensor, token_count = load_tensor(paths)
+                    if tensor is None or token_count is None:
+                        raise ValueError("dump reconstruction failed")
+                    if token_count != usable_inventory[key]:
+                        raise ValueError(
+                            f"reconstructed token count is {token_count}, "
+                            f"expected {usable_inventory[key]}"
+                        )
+                    if kv == TensorFileManager.KV.K:
+                        tensor = Rope.invert_rope(tensor)
+                    request_shapes[key] = tuple(tensor.shape[1:])
+                    del tensor
+                except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                    rejected[key].append(f"{worker}/{kv.name}: {error}")
+
+            shapes_by_job[(worker, kv)] = request_shapes
+
+    load_valid_keys = [key for key in request_keys if key not in rejected]
+    if not load_valid_keys:
+        raise TokenSelectionError(
+            "No dump requests load successfully across every worker and K/V tensor"
+        )
+
+    canonical_shapes = {}
+    for (worker, kv), request_shapes in shapes_by_job.items():
+        canonical_shape, _ = Counter(
+            request_shapes[key] for key in load_valid_keys
+        ).most_common(1)[0]
+        canonical_shapes[(worker, kv)] = canonical_shape
+        for key in load_valid_keys:
+            shape = request_shapes[key]
+            if shape != canonical_shape:
+                rejected[key].append(
+                    f"{worker}/{kv.name}: feature shape {shape}, "
+                    f"expected {canonical_shape}"
+                )
+
+    valid_inventory = {
+        key: token_count
+        for key, token_count in usable_inventory.items()
+        if key not in rejected
+    }
+    for key in request_keys:
+        if key in rejected:
+            logger.warning(
+                "Excluding request %s globally: %s",
+                key,
+                "; ".join(rejected[key]),
+            )
+    if not valid_inventory:
+        raise TokenSelectionError(
+            "No dump requests are valid across every worker and K/V tensor"
+        )
+
+    logger.info(
+        "Globally validated %d of %d usable dump requests across all SVD jobs; "
+        "job feature shapes: %s",
+        len(valid_inventory),
+        len(usable_inventory),
+        {
+            f"{worker}/{kv.name}": shape
+            for (worker, kv), shape in canonical_shapes.items()
+        },
+    )
+    return valid_inventory
+
+
 def build_global_sampling_requests(tensor_managers, workers, sample_tokens):
-    """Validate identical worker/KV inventories and compute shared budgets."""
+    """Fully validate requests globally and compute shared sampling budgets."""
     reference_worker = workers[0]
     reference_manager = tensor_managers[reference_worker]
     reference_kv = TensorFileManager.KV.K
@@ -892,12 +1003,28 @@ def build_global_sampling_requests(tensor_managers, workers, sample_tokens):
     if not usable_inventory:
         raise TokenSelectionError("No usable dump requests remain after length filtering")
 
+    usable_inventory = validate_global_requests(
+        tensor_managers, workers, usable_inventory
+    )
+    eligible_context_groups = {
+        dataset_path: Counter(
+            TensorFileManager.Sequence.bucket(token_count)
+            for (request_dataset, _), token_count in usable_inventory.items()
+            if request_dataset == dataset_path
+        )
+        for dataset_path in reference_manager.datasets_list
+    }
+
     requests = []
     for (dataset_path, request_id), token_count in sorted(
         usable_inventory.items(), key=lambda item: (str(item[0][0]), item[0][1])
     ):
         sampling_budget = reference_manager.get_token_budget(
-            reference_kv, dataset_path, sample_tokens, token_count
+            reference_kv,
+            dataset_path,
+            sample_tokens,
+            token_count,
+            context_groups=eligible_context_groups,
         )
         if sampling_budget >= token_count - 2 * SINK_TOKENS:
             raise TokenSelectionError(
@@ -1163,24 +1290,31 @@ def SVD(
 
     sampled_data = []
 
-    for kv_cache_paths in tensor_manager.datasets_list:
-        for paths in tensor_manager.datasets[kv_cache_paths][kv]:
-            tensor, token_count = load_tensor(paths)
-            if tensor is None or token_count is None:
+    for kv_cache_paths in sorted(tensor_manager.datasets_list, key=str):
+        request_paths = sorted(
+            tensor_manager.datasets[kv_cache_paths][kv],
+            key=lambda paths: paths[0].name.split(kv.value, 1)[0],
+        )
+        for paths in request_paths:
+            request_id = paths[0].name.split(kv.value, 1)[0]
+            if not selection_store.contains(kv_cache_paths, request_id):
                 continue
 
-            if token_count < TensorFileManager.Sequence.SHORT:
-                logger.warning(
-                    "Skipping %s: only %s tokens after reconstruction",
-                    paths[0],
-                    token_count,
+            tensor, token_count = load_tensor(paths)
+            if tensor is None or token_count is None:
+                raise RuntimeError(
+                    f"Selected request {paths[0]} failed dump reconstruction"
                 )
-                continue
+
+            if token_count < TensorFileManager.Sequence.SHORT:
+                raise RuntimeError(
+                    f"Selected request {paths[0]} has only {token_count} tokens "
+                    "after reconstruction"
+                )
 
             try:
                 if undo_rope:
                     tensor = Rope.invert_rope(tensor)
-                request_id = paths[0].name.split(kv.value, 1)[0]
                 token_indices = selection_store.get(
                     kv_cache_paths, request_id, token_count
                 )
@@ -1188,7 +1322,9 @@ def SVD(
             except TokenSelectionError:
                 raise
             except (AssertionError, RuntimeError, ValueError) as error:
-                logger.warning("Skipping %s: %s", paths[0], error)
+                raise RuntimeError(
+                    f"Selected request {paths[0]} failed preprocessing: {error}"
+                ) from error
 
     pprint.pp([d.shape for d in sampled_data])
 
@@ -1198,6 +1334,12 @@ def SVD(
     input_tensor = transform_tensors(sampled_data)
 
     n, p = input_tensor.shape
+    expected_n = selection_store.sample_count()
+    if n != expected_n:
+        raise TokenSelectionError(
+            f"SVD input contains {n} sampled tokens, but the global selection "
+            f"contains {expected_n}"
+        )
     dtype = input_tensor.dtype
     logger.info(f"SVD input tensor shape (n={n})x(p={p}). Dtype {dtype}")
 
@@ -1465,6 +1607,7 @@ def run():
         worker: TensorFileManager(input_dir_list, worker, sampling_policy)
         for worker in workers
     }
+    Rope.load_model_config(args.model_dir)
     global_sampling_requests = build_global_sampling_requests(
         tensor_managers, workers, N
     )
@@ -1524,8 +1667,6 @@ def run():
         "SVD artifact directory for current sampling/SVD parameters: %s",
         artifact_directory,
     )
-
-    Rope.load_model_config(args.model_dir)
 
     # This is the authoritative mapping between an SVD artifact and its final
     # output index. Never infer this mapping from completion or directory order.
