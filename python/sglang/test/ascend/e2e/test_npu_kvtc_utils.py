@@ -323,6 +323,8 @@ class _AscendKvtcTestCaseBase:
                     str(cls.kvtc_calibration_params["niter"]),
                     "--sampling-policy",
                     "relaxed",
+                    "--svd-cache-policy",
+                    "reuse",
                 ],
                 check=True,
                 capture_output=True,

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
+import json
 import random
 import os
 import math
@@ -10,8 +12,9 @@ import pprint
 import logging
 import sys
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.append("../python")
 from sglang.srt.mem_cache.allocator import token
@@ -29,6 +32,316 @@ from enum import Enum, IntEnum
 logger = logging.getLogger()
 WORKER_DIR_PATTERN = re.compile(r"^tp_(\d+)_pp_(\d+)$")
 KVTC_FILE_VERSION="v1-noquant"
+TOKEN_SELECTION_FILE_VERSION = 2
+SVD_ARTIFACT_FILE_VERSION = 1
+SINK_TOKENS = 128
+SVD_WORKERS = 4
+
+
+def stable_digest(value):
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class TokenSelectionError(ValueError):
+    pass
+
+
+class SVDArtifactError(ValueError):
+    pass
+
+
+class TokenSelectionStore:
+    """Finalize, persist, and serve one global selection per dump request."""
+
+    def __init__(
+        self,
+        *,
+        mode,
+        path,
+        input_dir,
+        model_dir,
+        sample_tokens,
+        sampling_policy,
+        dump_directories,
+        workers,
+    ):
+        if mode not in (None, "load", "save"):
+            raise TokenSelectionError(f"Invalid token selection mode: {mode}")
+        self.mode = mode
+        self.path = path
+        self.input_dir = input_dir.absolute()
+        self._selections = {}
+        self._loaded_selections = None
+        self._finalized = False
+
+        self.metadata = {
+            "kvtc_version": KVTC_FILE_VERSION,
+            "model_dir": str(model_dir.resolve()),
+            "sample_tokens": sample_tokens,
+            "sampling_policy": sampling_policy.name.lower(),
+            "dump_directories": [
+                self._relative_path(path) for path in dump_directories
+            ],
+            "workers": workers,
+            "sink_tokens_per_side": SINK_TOKENS,
+        }
+        if self.mode == "load":
+            self._load()
+
+    def _relative_path(self, path):
+        try:
+            return path.absolute().relative_to(self.input_dir).as_posix()
+        except ValueError as error:
+            raise TokenSelectionError(
+                f"Selection source {path} is outside input directory {self.input_dir}"
+            ) from error
+
+    def _selection_key(self, dataset_path, request_id):
+        return self._relative_path(dataset_path), request_id
+
+    def _load(self):
+        try:
+            with self.path.open(encoding="utf-8") as file:
+                document = json.load(file)
+        except FileNotFoundError as error:
+            raise TokenSelectionError(
+                f"Token selection file does not exist: {self.path}"
+            ) from error
+        except (OSError, json.JSONDecodeError) as error:
+            raise TokenSelectionError(
+                f"Cannot load token selection file {self.path}: {error}"
+            ) from error
+
+        if not isinstance(document, dict):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} must contain a JSON object"
+            )
+        if document.get("version") != TOKEN_SELECTION_FILE_VERSION:
+            raise TokenSelectionError(
+                f"Unsupported token selection file version in {self.path}: "
+                f"{document.get('version')!r}; expected {TOKEN_SELECTION_FILE_VERSION}"
+            )
+
+        saved_metadata = document.get("metadata")
+        if not isinstance(saved_metadata, dict):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} has no valid metadata object"
+            )
+        saved_sample_tokens = saved_metadata.get("sample_tokens")
+        expected_sample_tokens = self.metadata["sample_tokens"]
+        if (
+            type(saved_sample_tokens) is not int
+            or saved_sample_tokens != expected_sample_tokens
+        ):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} is incompatible with this run; "
+                f"sample_tokens={saved_sample_tokens!r}, "
+                f"but current -N is {expected_sample_tokens}"
+            )
+
+        selections = document.get("selections")
+        if not isinstance(selections, list):
+            raise TokenSelectionError(
+                f"Token selection file {self.path} has no valid selections list"
+            )
+
+        loaded_selections = {}
+        for selection in selections:
+            try:
+                key = (
+                    selection["dump_directory"],
+                    selection["request_id"],
+                )
+            except (KeyError, TypeError) as error:
+                raise TokenSelectionError(
+                    f"Malformed selection entry in {self.path}: {selection!r}"
+                ) from error
+            if key in loaded_selections:
+                raise TokenSelectionError(
+                    f"Duplicate selection entry in {self.path}: {key}"
+                )
+            loaded_selections[key] = selection
+
+        self._loaded_selections = loaded_selections
+        logger.info(
+            "Loaded %d token selections from %s",
+            len(self._loaded_selections),
+            self.path,
+        )
+
+    @staticmethod
+    def _validate_indices(key, indices, token_count, sampling_budget):
+        if (
+            not isinstance(indices, list)
+            or len(indices) != sampling_budget
+            or any(type(index) is not int for index in indices)
+            or indices != sorted(set(indices))
+            or any(
+                index < SINK_TOKENS or index >= token_count - SINK_TOKENS
+                for index in indices
+            )
+        ):
+            raise TokenSelectionError(
+                f"Saved selection for {key} contains invalid token indices"
+            )
+
+    def finalize(self, requests):
+        """Finalize every selection and save it, when requested, before SVD."""
+        if self._finalized:
+            raise TokenSelectionError("Token selections have already been finalized")
+
+        expected_keys = set()
+        for request in requests:
+            key = self._selection_key(
+                request["dataset_path"], request["request_id"]
+            )
+            if key in expected_keys:
+                raise TokenSelectionError(f"Duplicate global dump request: {key}")
+            expected_keys.add(key)
+
+            expected = {
+                "dump_directory": key[0],
+                "request_id": key[1],
+                "token_count": request["token_count"],
+                "sampling_budget": request["sampling_budget"],
+            }
+            if self.mode == "load":
+                selection = self._loaded_selections.get(key)
+                if selection is None:
+                    raise TokenSelectionError(
+                        f"No saved global token selection for {key}"
+                    )
+                differing_fields = [
+                    field
+                    for field, value in expected.items()
+                    if selection.get(field) != value
+                ]
+                if differing_fields:
+                    raise TokenSelectionError(
+                        f"Saved selection for {key} does not match the current dump; "
+                        f"different fields: {', '.join(differing_fields)}"
+                    )
+                indices = selection.get("selected_token_indices")
+                self._validate_indices(
+                    key,
+                    indices,
+                    request["token_count"],
+                    request["sampling_budget"],
+                )
+            else:
+                indices = sorted(
+                    random.sample(
+                        range(
+                            SINK_TOKENS,
+                            request["token_count"] - SINK_TOKENS,
+                        ),
+                        request["sampling_budget"],
+                    )
+                )
+
+            self._selections[key] = {
+                **expected,
+                "selected_token_indices": indices,
+            }
+
+        if self.mode == "load":
+            unused = set(self._loaded_selections) - expected_keys
+            if unused:
+                raise TokenSelectionError(
+                    f"Token selection file {self.path} contains {len(unused)} "
+                    f"unused selections, including: {sorted(unused)[:3]}"
+                )
+
+        self._finalized = True
+        if self.mode == "save":
+            self._save()
+        elif self.mode == "load":
+            logger.info("Reused all global token selections from %s", self.path)
+        else:
+            logger.info("Finalized %d global token selections", len(self._selections))
+
+    def _save(self):
+        document = {
+            "version": TOKEN_SELECTION_FILE_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": self.metadata,
+            "selections": sorted(
+                self._selections.values(),
+                key=lambda selection: (
+                    selection["dump_directory"],
+                    selection["request_id"],
+                ),
+            ),
+        }
+        temporary_path = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(document, file, indent=2)
+                file.write("\n")
+            os.replace(temporary_path, self.path)
+        except OSError as error:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise TokenSelectionError(
+                f"Cannot save token selections to {self.path}: {error}"
+            ) from error
+        logger.info(
+            "Saved %d global token selections to %s",
+            len(self._selections),
+            self.path,
+        )
+
+    def get(self, dataset_path, request_id, token_count):
+        if not self._finalized:
+            raise TokenSelectionError("Token selections were not finalized before SVD")
+        key = self._selection_key(dataset_path, request_id)
+        selection = self._selections.get(key)
+        if selection is None:
+            raise TokenSelectionError(f"No global token selection for {key}")
+        if selection["token_count"] != token_count:
+            raise TokenSelectionError(
+                f"Token count changed after discovery for {key}: expected "
+                f"{selection['token_count']}, got {token_count}"
+            )
+        return selection["selected_token_indices"]
+
+    def contains(self, dataset_path, request_id):
+        if not self._finalized:
+            raise TokenSelectionError("Token selections were not finalized before SVD")
+        return self._selection_key(dataset_path, request_id) in self._selections
+
+    def sample_count(self):
+        if not self._finalized:
+            raise TokenSelectionError("Token selections were not finalized before SVD")
+        return sum(
+            len(selection["selected_token_indices"])
+            for selection in self._selections.values()
+        )
+
+    def identity(self):
+        if not self._finalized:
+            raise TokenSelectionError(
+                "Token selections were not finalized before computing their identity"
+            )
+        return {
+            "metadata": self.metadata,
+            "selections": sorted(
+                self._selections.values(),
+                key=lambda selection: (
+                    selection["dump_directory"],
+                    selection["request_id"],
+                ),
+            ),
+        }
+
+    def digest(self):
+        return stable_digest(self.identity())
 
 
 class Rope(object):
@@ -289,16 +602,8 @@ def load_tensor(paths):
     return ret, ret.shape[0]
 
 
-def trim_sink_tokens(tensor):
-    return tensor[128:-128]
-
-
-def sample_tokens(tensor, sampling_budget):
-    token_cnt = tensor.shape[0]
-    ids = random.sample(list(range(token_cnt)), sampling_budget)
-    ids.sort()
-
-    ids = torch.Tensor(ids).to(device="cpu").int()
+def sample_tokens(tensor, token_indices):
+    ids = torch.tensor(token_indices, device="cpu", dtype=torch.long)
     logger.debug(f"Sample ids\n{ids}")
 
     ret = tensor[ids, :].to(dtype=torch.float32, copy=True)
@@ -312,20 +617,13 @@ def transform_tensors(tensors):
         raise ValueError("No valid calibration tensors were loaded")
 
     feature_shapes = Counter(tensor.shape[1:] for tensor in tensors)
-    feature_shape, _ = feature_shapes.most_common(1)[0]
-    valid_tensors = [tensor for tensor in tensors if tensor.shape[1:] == feature_shape]
-    discarded = len(tensors) - len(valid_tensors)
-    if discarded:
-        logger.warning(
-            "Discarding %s sampled tensors with non-canonical feature shapes; "
-            "using %s from %s tensors",
-            discarded,
-            feature_shape,
-            len(valid_tensors),
+    if len(feature_shapes) != 1:
+        raise ValueError(
+            "Selected calibration tensors have different feature shapes: "
+            f"{dict(feature_shapes)}"
         )
-        logger.warning("Observed sampled feature shapes: %s", dict(feature_shapes))
 
-    ret = torch.concat(valid_tensors, dim=0).flatten(start_dim=1)
+    ret = torch.concat(tensors, dim=0).flatten(start_dim=1)
 
     torch.cpu.synchronize()
 
@@ -359,16 +657,21 @@ class TensorFileManager(object):
     def __init__(self, input_dir_list, tp_pp_worker, sampling_policy):
         self.datasets = {}
         self.context_groups = {}
+        self.token_counts = {}
         self.total_tokens = {kv: 0 for kv in TensorFileManager.KV}
         self.sampling_policy = sampling_policy
 
         for dataset_path in input_dir_list:
             self.datasets[dataset_path] = {}
             self.context_groups[dataset_path] = {}
+            self.token_counts[dataset_path] = {}
             for kv in TensorFileManager.KV:
-                files, counter = self._get_tensors_paths(dataset_path, tp_pp_worker, kv)
+                files, counter, token_counts = self._get_tensors_paths(
+                    dataset_path, tp_pp_worker, kv
+                )
                 self.datasets[dataset_path][kv] = files
                 self.context_groups[dataset_path][kv] = counter
+                self.token_counts[dataset_path][kv] = token_counts
 
         self.datasets_list = list(self.datasets.keys())
 
@@ -402,8 +705,8 @@ class TensorFileManager(object):
         file_groups = list(sequences.values())
 
         ret = []
+        token_counts = {}
         counter = {b: 0 for b in TensorFileManager.Sequence}
-        buckets = {b: 0 for b in TensorFileManager.Sequence}
         logger.info(f"Looking for {kv} tensors at {tensor_dir / tp_pp_worker}")
         for fg in file_groups:
             chunks = [
@@ -428,31 +731,25 @@ class TensorFileManager(object):
                     error,
                 )
                 continue
+            request_id = fg[0].name.split(kv.value, 1)[0]
+            token_counts[request_id] = token_count
             bucket = TensorFileManager.Sequence.bucket(token_count)
             match bucket:
                 case TensorFileManager.Sequence.IGNORE:
                     counter[bucket] += 1
-                    buckets[bucket] += 1
-                    kv = (
-                        TensorFileManager.KV.K
-                        if TensorFileManager.KV.K in fg
-                        else TensorFileManager.KV.V
-                    )
                     logger.info(
                         f"Ignoring too short sequence {kv}. min_len=1000, ignored len={token_count}"
                     )
                 case TensorFileManager.Sequence.SHORT:
                     counter[bucket] += 1
-                    buckets[bucket] += 1
                     self.total_tokens[kv] += token_count
                     ret.append(fg)
                 case TensorFileManager.Sequence.LONG:
                     counter[bucket] += 1
-                    buckets[bucket] += 1
                     self.total_tokens[kv] += token_count
                     ret.append(fg)
 
-        return ret, counter
+        return ret, counter, token_counts
 
     def _log_detected_files(self):
         logger.debug(f"Tensor files:")
@@ -462,9 +759,32 @@ class TensorFileManager(object):
                     logger.debug(f"{path_list}")
             logger.debug(f"{self.context_groups[ds][kv]}")
 
-    def get_token_budget(self, kv: KV, dataset_name, N, tensor):
-        token_cnt = tensor.shape[0]
-        sink_tokens = 256
+    def get_sequence_inventory(self, kv):
+        return {
+            (dataset_path, request_id): token_count
+            for dataset_path in self.datasets_list
+            for request_id, token_count in self.token_counts[dataset_path][kv].items()
+        }
+
+    def get_token_budget(
+        self, kv: KV, dataset_name, N, token_cnt, context_groups=None
+    ):
+        sink_tokens = 2 * SINK_TOKENS
+
+        if context_groups is None:
+            def group_count(dataset, bucket):
+                return self.context_groups[dataset][kv][bucket]
+
+            datasets = self.datasets_list
+        else:
+            def group_count(dataset, bucket):
+                return context_groups[dataset][bucket]
+
+            datasets = [
+                dataset
+                for dataset in self.datasets_list
+                if sum(context_groups[dataset].values()) > 0
+            ]
 
         if self.sampling_policy == TensorFileManager.SamplingPolicy.STRICT:
             assert token_cnt >= 1000
@@ -476,8 +796,8 @@ class TensorFileManager(object):
             )
 
             nonempty_groups = sum(
-                self.context_groups[dataset][kv][bucket] > 0
-                for dataset in self.datasets_list
+                group_count(dataset, bucket) > 0
+                for dataset in datasets
                 for bucket in (
                     TensorFileManager.Sequence.SHORT,
                     TensorFileManager.Sequence.LONG,
@@ -486,7 +806,7 @@ class TensorFileManager(object):
             token_budget = math.ceil(
                 N
                 / nonempty_groups
-                / self.context_groups[dataset_name][kv][bucket]
+                / group_count(dataset_name, bucket)
             )
 
             if token_budget > token_cnt - sink_tokens:
@@ -502,11 +822,11 @@ class TensorFileManager(object):
             assert token_cnt >= 1000
             # Equal amount of tokens will be sampled from each dataset, but ignore short vs long contexts
 
-            dataset_token_budget = math.ceil(N / len(self.datasets_list))
+            dataset_token_budget = math.ceil(N / len(datasets))
 
             sequences_cnt = (
-                self.context_groups[dataset_name][kv][TensorFileManager.Sequence.SHORT]
-                + self.context_groups[dataset_name][kv][TensorFileManager.Sequence.LONG]
+                group_count(dataset_name, TensorFileManager.Sequence.SHORT)
+                + group_count(dataset_name, TensorFileManager.Sequence.LONG)
             )
 
             token_budget = math.ceil(dataset_token_budget / sequences_cnt)
@@ -524,13 +844,13 @@ class TensorFileManager(object):
 
             sequences_cnt = 0
 
-            for dataset in self.context_groups:
-                sequences_cnt += self.context_groups[dataset][kv][
-                    TensorFileManager.Sequence.SHORT
-                ]
-                sequences_cnt += self.context_groups[dataset][kv][
-                    TensorFileManager.Sequence.LONG
-                ]
+            for dataset in datasets:
+                sequences_cnt += group_count(
+                    dataset, TensorFileManager.Sequence.SHORT
+                )
+                sequences_cnt += group_count(
+                    dataset, TensorFileManager.Sequence.LONG
+                )
 
             token_budget = math.ceil(N / sequences_cnt)
 
@@ -547,12 +867,416 @@ class TensorFileManager(object):
             assert False, f"Invalid sampling policy {self.sampling_policy}"
 
 
+def validate_global_requests(tensor_managers, workers, usable_inventory):
+    """Return requests that reconstruct with one consistent shape in every job."""
+    request_keys = sorted(usable_inventory, key=lambda key: (str(key[0]), key[1]))
+    rejected = defaultdict(list)
+    shapes_by_job = {}
+
+    for worker in workers:
+        manager = tensor_managers[worker]
+        for kv in TensorFileManager.KV:
+            paths_by_request = {
+                (dataset_path, paths[0].name.split(kv.value, 1)[0]): paths
+                for dataset_path in manager.datasets_list
+                for paths in manager.datasets[dataset_path][kv]
+            }
+            request_shapes = {}
+            for key in request_keys:
+                paths = paths_by_request.get(key)
+                if paths is None:
+                    rejected[key].append(f"{worker}/{kv.name}: no usable dump files")
+                    continue
+                try:
+                    tensor, token_count = load_tensor(paths)
+                    if tensor is None or token_count is None:
+                        raise ValueError("dump reconstruction failed")
+                    if token_count != usable_inventory[key]:
+                        raise ValueError(
+                            f"reconstructed token count is {token_count}, "
+                            f"expected {usable_inventory[key]}"
+                        )
+                    if kv == TensorFileManager.KV.K:
+                        tensor = Rope.invert_rope(tensor)
+                    request_shapes[key] = tuple(tensor.shape[1:])
+                    del tensor
+                except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                    rejected[key].append(f"{worker}/{kv.name}: {error}")
+
+            shapes_by_job[(worker, kv)] = request_shapes
+
+    load_valid_keys = [key for key in request_keys if key not in rejected]
+    if not load_valid_keys:
+        raise TokenSelectionError(
+            "No dump requests load successfully across every worker and K/V tensor"
+        )
+
+    canonical_shapes = {}
+    for (worker, kv), request_shapes in shapes_by_job.items():
+        canonical_shape, _ = Counter(
+            request_shapes[key] for key in load_valid_keys
+        ).most_common(1)[0]
+        canonical_shapes[(worker, kv)] = canonical_shape
+        for key in load_valid_keys:
+            shape = request_shapes[key]
+            if shape != canonical_shape:
+                rejected[key].append(
+                    f"{worker}/{kv.name}: feature shape {shape}, "
+                    f"expected {canonical_shape}"
+                )
+
+    valid_inventory = {
+        key: token_count
+        for key, token_count in usable_inventory.items()
+        if key not in rejected
+    }
+    for key in request_keys:
+        if key in rejected:
+            logger.warning(
+                "Excluding request %s globally: %s",
+                key,
+                "; ".join(rejected[key]),
+            )
+    if not valid_inventory:
+        raise TokenSelectionError(
+            "No dump requests are valid across every worker and K/V tensor"
+        )
+
+    logger.info(
+        "Globally validated %d of %d usable dump requests across all SVD jobs; "
+        "job feature shapes: %s",
+        len(valid_inventory),
+        len(usable_inventory),
+        {
+            f"{worker}/{kv.name}": shape
+            for (worker, kv), shape in canonical_shapes.items()
+        },
+    )
+    return valid_inventory
+
+
+def build_global_sampling_requests(tensor_managers, workers, sample_tokens):
+    """Fully validate requests globally and compute shared sampling budgets."""
+    reference_worker = workers[0]
+    reference_manager = tensor_managers[reference_worker]
+    reference_kv = TensorFileManager.KV.K
+    reference_inventory = reference_manager.get_sequence_inventory(reference_kv)
+    if not reference_inventory:
+        raise TokenSelectionError(
+            f"No dump requests found for {reference_worker}/{reference_kv.name}"
+        )
+
+    reference_keys = set(reference_inventory)
+    for worker in workers:
+        manager = tensor_managers[worker]
+        for kv in TensorFileManager.KV:
+            inventory = manager.get_sequence_inventory(kv)
+            inventory_keys = set(inventory)
+            if inventory_keys != reference_keys:
+                missing = sorted(reference_keys - inventory_keys, key=str)[:3]
+                extra = sorted(inventory_keys - reference_keys, key=str)[:3]
+                raise TokenSelectionError(
+                    "Dump request sets differ across workers or K/V tensors: "
+                    f"{worker}/{kv.name} is missing {missing} and has extra {extra} "
+                    f"relative to {reference_worker}/{reference_kv.name}"
+                )
+
+            mismatched = [
+                (key, reference_inventory[key], inventory[key])
+                for key in sorted(reference_keys, key=str)
+                if inventory[key] != reference_inventory[key]
+            ]
+            if mismatched:
+                key, expected, actual = mismatched[0]
+                raise TokenSelectionError(
+                    "Dump token counts differ across workers or K/V tensors for "
+                    f"{key}: {reference_worker}/{reference_kv.name} has {expected}, "
+                    f"but {worker}/{kv.name} has {actual}"
+                )
+
+    usable_inventory = {
+        key: token_count
+        for key, token_count in reference_inventory.items()
+        if TensorFileManager.Sequence.bucket(token_count)
+        != TensorFileManager.Sequence.IGNORE
+    }
+    if not usable_inventory:
+        raise TokenSelectionError("No usable dump requests remain after length filtering")
+
+    usable_inventory = validate_global_requests(
+        tensor_managers, workers, usable_inventory
+    )
+    eligible_context_groups = {
+        dataset_path: Counter(
+            TensorFileManager.Sequence.bucket(token_count)
+            for (request_dataset, _), token_count in usable_inventory.items()
+            if request_dataset == dataset_path
+        )
+        for dataset_path in reference_manager.datasets_list
+    }
+
+    requests = []
+    for (dataset_path, request_id), token_count in sorted(
+        usable_inventory.items(), key=lambda item: (str(item[0][0]), item[0][1])
+    ):
+        sampling_budget = reference_manager.get_token_budget(
+            reference_kv,
+            dataset_path,
+            sample_tokens,
+            token_count,
+            context_groups=eligible_context_groups,
+        )
+        if sampling_budget >= token_count - 2 * SINK_TOKENS:
+            raise TokenSelectionError(
+                f"Sampling budget {sampling_budget} leaves no non-sink tokens in "
+                f"{dataset_path}/{request_id} with {token_count} tokens"
+            )
+        requests.append(
+            {
+                "dataset_path": dataset_path,
+                "request_id": request_id,
+                "token_count": token_count,
+                "sampling_budget": sampling_budget,
+            }
+        )
+
+    logger.info(
+        "Validated %d dump requests across %d workers and both K/V tensors; "
+        "%d requests are eligible for global sampling",
+        len(reference_inventory),
+        len(workers),
+        len(requests),
+    )
+    return requests
+
+
+def build_svd_cache_metadata(
+    *,
+    input_dir,
+    model_dir,
+    dump_directories,
+    workers,
+    sampling_requests,
+    sample_tokens,
+    sampling_policy,
+    svd_dim,
+    svd_iter,
+):
+    input_dir = input_dir.absolute()
+    return {
+        "artifact_version": SVD_ARTIFACT_FILE_VERSION,
+        "kvtc_version": KVTC_FILE_VERSION,
+        "input_dir": str(input_dir),
+        "model_dir": str(model_dir.resolve()),
+        "dump_directories": [
+            path.absolute().relative_to(input_dir).as_posix()
+            for path in dump_directories
+        ],
+        "workers": list(workers),
+        "sample_tokens": sample_tokens,
+        "sampling_policy": sampling_policy.name.lower(),
+        "sink_tokens_per_side": SINK_TOKENS,
+        "sampling_requests_digest": stable_digest(
+            [
+                {
+                    "dump_directory": request["dataset_path"]
+                    .absolute()
+                    .relative_to(input_dir)
+                    .as_posix(),
+                    "request_id": request["request_id"],
+                    "token_count": request["token_count"],
+                    "sampling_budget": request["sampling_budget"],
+                }
+                for request in sampling_requests
+            ]
+        ),
+        "svd_dim": svd_dim,
+        "svd_iter": svd_iter,
+    }
+
+
+def build_svd_cache_directory(output_path, cache_metadata):
+    configuration_digest = stable_digest(cache_metadata)
+    run_name = (
+        f"kvtc-{KVTC_FILE_VERSION}"
+        f"_N-{cache_metadata['sample_tokens']}"
+        f"_policy-{cache_metadata['sampling_policy']}"
+        f"_q-{cache_metadata['svd_dim']}"
+        f"_niter-{cache_metadata['svd_iter']}"
+        f"_{configuration_digest}"
+    )
+    return output_path.with_name(f"{output_path.name}.svd-artifacts") / run_name
+
+
+def build_svd_job_metadata(cache_metadata, selection_digest, worker, kv):
+    match = WORKER_DIR_PATTERN.fullmatch(worker)
+    if match is None:
+        raise SVDArtifactError(f"Invalid worker name for SVD artifact: {worker}")
+    tp_rank, pp_rank = map(int, match.groups())
+    return {
+        **cache_metadata,
+        "token_selection_digest": selection_digest,
+        "worker": worker,
+        "tp_rank": tp_rank,
+        "pp_rank": pp_rank,
+        "kv": kv.name,
+        "undo_rope": kv == TensorFileManager.KV.K,
+    }
+
+
+def save_svd_artifact(path, temporary_path, metadata, mu, basis):
+    document = {
+        "version": SVD_ARTIFACT_FILE_VERSION,
+        "metadata": metadata,
+        "mu": mu,
+        "basis": basis,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(document, temporary_path)
+        os.replace(temporary_path, path)
+    except Exception as error:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SVDArtifactError(f"Cannot save SVD artifact {path}: {error}") from error
+
+
+def load_svd_artifact(path, expected_metadata):
+    try:
+        document = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise SVDArtifactError(f"Cannot load SVD artifact {path}: {error}") from error
+
+    if not isinstance(document, dict):
+        raise SVDArtifactError(f"SVD artifact {path} must contain a dictionary")
+    if document.get("version") != SVD_ARTIFACT_FILE_VERSION:
+        raise SVDArtifactError(
+            f"Unsupported SVD artifact version in {path}: "
+            f"{document.get('version')!r}; expected {SVD_ARTIFACT_FILE_VERSION}"
+        )
+
+    metadata = document.get("metadata")
+    identity_fields = ("worker", "kv")
+    if not isinstance(metadata, dict):
+        differing_fields = ["metadata"]
+    else:
+        differing_fields = [
+            field
+            for field in identity_fields
+            if metadata.get(field) != expected_metadata.get(field)
+        ]
+    if differing_fields:
+        raise SVDArtifactError(
+            f"SVD artifact {path} is incompatible with its expected final index; "
+            f"different metadata fields: {', '.join(differing_fields)}"
+        )
+
+    mu = document.get("mu")
+    basis = document.get("basis")
+    if not isinstance(mu, torch.Tensor) or not isinstance(basis, torch.Tensor):
+        raise SVDArtifactError(f"SVD artifact {path} has no valid mu/basis tensors")
+    if mu.device.type != "cpu" or basis.device.type != "cpu":
+        raise SVDArtifactError(f"SVD artifact {path} did not load on CPU")
+    if mu.dtype != torch.float32 or basis.dtype != torch.float32:
+        raise SVDArtifactError(
+            f"SVD artifact {path} has dtype mu={mu.dtype}, basis={basis.dtype}; "
+            "expected torch.float32"
+        )
+    return mu, basis
+
+
+def assemble_svd_output(workers, jobs):
+    expected_pairs = {
+        (worker, kv) for worker in workers for kv in TensorFileManager.KV
+    }
+    actual_pairs = set(jobs)
+    if actual_pairs != expected_pairs:
+        missing = sorted(expected_pairs - actual_pairs, key=lambda pair: str(pair))
+        extra = sorted(actual_pairs - expected_pairs, key=lambda pair: str(pair))
+        raise SVDArtifactError(
+            f"SVD artifact index is incomplete: missing={missing}, extra={extra}"
+        )
+
+    output_dict = {
+        "version": KVTC_FILE_VERSION,
+        "keys": {worker: {"mu": None, "basis": None} for worker in workers},
+        "values": {worker: {"mu": None, "basis": None} for worker in workers},
+    }
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            job = jobs[(worker, kv)]
+            mu, basis = load_svd_artifact(job["path"], job["metadata"])
+            section = "keys" if kv == TensorFileManager.KV.K else "values"
+            output_dict[section][worker]["mu"] = mu
+            output_dict[section][worker]["basis"] = basis
+            logger.info(
+                "Assigned SVD artifact %s to final index %s/%s",
+                job["path"],
+                section,
+                worker,
+            )
+
+    for section in ("keys", "values"):
+        for worker in workers:
+            if any(
+                output_dict[section][worker][name] is None
+                for name in ("mu", "basis")
+            ):
+                raise SVDArtifactError(
+                    f"Final SVD output index {section}/{worker} was not populated"
+                )
+    return output_dict
+
+
+def select_svd_jobs(workers, jobs, cache_policy):
+    if cache_policy not in ("reuse", "overwrite"):
+        raise SVDArtifactError(f"Invalid SVD cache policy: {cache_policy}")
+
+    jobs_to_run = []
+    reused_jobs = 0
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            job = jobs[(worker, kv)]
+            artifact_path = job["path"]
+            if artifact_path.exists() and not artifact_path.is_file():
+                raise SVDArtifactError(
+                    f"SVD artifact path exists but is not a file: {artifact_path}"
+                )
+            if cache_policy == "reuse" and artifact_path.is_file():
+                logger.info(
+                    "Skipping SVD for worker=%s kv=%s: artifact already exists at %s",
+                    worker,
+                    kv.name,
+                    artifact_path,
+                )
+                reused_jobs += 1
+                continue
+            if artifact_path.is_file():
+                logger.info(
+                    "Overwriting SVD artifact for worker=%s kv=%s at %s",
+                    worker,
+                    kv.name,
+                    artifact_path,
+                )
+            jobs_to_run.append((worker, kv, job))
+
+    logger.info(
+        "SVD jobs: %d reused, %d scheduled, %d total",
+        reused_jobs,
+        len(jobs_to_run),
+        len(jobs),
+    )
+    return jobs_to_run
+
+
 def SVD(
     tensor_manager: TensorFileManager,
+    selection_store: TokenSelectionStore,
     svd_dim: int,
     svd_iter: int,
     kv: TensorFileManager.KV,
-    N: int,
     undo_rope: bool,
 ):
     logger.info(
@@ -566,36 +1290,41 @@ def SVD(
 
     sampled_data = []
 
-    for kv_cache_paths in tensor_manager.datasets_list:
-        for paths in tensor_manager.datasets[kv_cache_paths][kv]:
+    for kv_cache_paths in sorted(tensor_manager.datasets_list, key=str):
+        request_paths = sorted(
+            tensor_manager.datasets[kv_cache_paths][kv],
+            key=lambda paths: paths[0].name.split(kv.value, 1)[0],
+        )
+        for paths in request_paths:
+            request_id = paths[0].name.split(kv.value, 1)[0]
+            if not selection_store.contains(kv_cache_paths, request_id):
+                continue
+
             tensor, token_count = load_tensor(paths)
             if tensor is None or token_count is None:
-                continue
+                raise RuntimeError(
+                    f"Selected request {paths[0]} failed dump reconstruction"
+                )
 
             if token_count < TensorFileManager.Sequence.SHORT:
-                logger.warning(
-                    "Skipping %s: only %s tokens after reconstruction",
-                    paths[0],
-                    token_count,
+                raise RuntimeError(
+                    f"Selected request {paths[0]} has only {token_count} tokens "
+                    "after reconstruction"
                 )
-                continue
 
             try:
-                sampling_budget = tensor_manager.get_token_budget(
-                    kv, kv_cache_paths, N, tensor
-                )
-                if sampling_budget >= token_count - 2 * 128:
-                    raise ValueError(
-                        f"sampling budget {sampling_budget} leaves no non-sink tokens "
-                        f"in {token_count}-token request"
-                    )
-
                 if undo_rope:
                     tensor = Rope.invert_rope(tensor)
-                tensor = trim_sink_tokens(tensor)
-                sampled_data.append(sample_tokens(tensor, sampling_budget))
+                token_indices = selection_store.get(
+                    kv_cache_paths, request_id, token_count
+                )
+                sampled_data.append(sample_tokens(tensor, token_indices))
+            except TokenSelectionError:
+                raise
             except (AssertionError, RuntimeError, ValueError) as error:
-                logger.warning("Skipping %s: %s", paths[0], error)
+                raise RuntimeError(
+                    f"Selected request {paths[0]} failed preprocessing: {error}"
+                ) from error
 
     pprint.pp([d.shape for d in sampled_data])
 
@@ -605,6 +1334,12 @@ def SVD(
     input_tensor = transform_tensors(sampled_data)
 
     n, p = input_tensor.shape
+    expected_n = selection_store.sample_count()
+    if n != expected_n:
+        raise TokenSelectionError(
+            f"SVD input contains {n} sampled tokens, but the global selection "
+            f"contains {expected_n}"
+        )
     dtype = input_tensor.dtype
     logger.info(f"SVD input tensor shape (n={n})x(p={p}). Dtype {dtype}")
 
@@ -618,6 +1353,53 @@ def SVD(
     logger.info(f"DONE SVD for data at")
 
     return per_feature_mean, U, S, Vh
+
+
+def run_svd_job(
+    tensor_manager: TensorFileManager,
+    selection_store: TokenSelectionStore,
+    worker: str,
+    kv: TensorFileManager.KV,
+    svd_dim: int,
+    svd_iter: int,
+    artifact_path: Path,
+    artifact_temporary_path: Path,
+    artifact_metadata: dict,
+):
+    mu, U, S, V = SVD(
+        tensor_manager,
+        selection_store,
+        svd_dim,
+        svd_iter,
+        kv,
+        undo_rope=kv == TensorFileManager.KV.K,
+    )
+    logger.info(
+        "%s/%s: mu=%s U=%s S=%s V=%s",
+        worker,
+        kv,
+        mu.shape,
+        U.shape,
+        S.shape,
+        V.shape,
+    )
+
+    # U and S are not part of the calibration output and can be large. Release
+    # them before persisting the tensors that are needed by the final object.
+    del U, S
+    save_svd_artifact(
+        artifact_path, artifact_temporary_path, artifact_metadata, mu, V
+    )
+    logger.info(
+        "Saved SVD artifact for worker=%s kv=%s at %s",
+        worker,
+        kv.name,
+        artifact_path,
+    )
+
+    # Futures must never retain output tensors while other SVD jobs are running.
+    del mu, V
+    return worker, kv, artifact_path
 
 
 def init_logger(log_dir, filename, log_level):
@@ -696,14 +1478,17 @@ def discover_dump_directories(input_dir: Path) -> tuple[list[Path], list[str]]:
     return dump_dirs, workers
 
 
-def run():
+def create_argument_parser():
     parser = argparse.ArgumentParser(
         usage=(
             f"\n{os.path.basename(__file__)}"
             " -N <token_sample_count> --niter <the number of subspace iterations for svd_lowrank>"
             " -q <a slightly overestimated rank of svd matrix>"
             " -i <dump-parent-directory>"
-            " -o <output_path> -m <model_path>\n"
+            " -o <output_path> -m <model_path>"
+            " --svd-cache-policy <reuse|overwrite>"
+            " [--save-selected-tokens <path> | --load-selected-tokens <path> |"
+            " --selected-tokens-cache <path>]\n"
         )
     )
     parser.add_argument(
@@ -756,6 +1541,40 @@ def run():
         default="strict",
         choices=list(str(p.name).lower() for p in TensorFileManager.SamplingPolicy),
     )
+    parser.add_argument(
+        "--svd-cache-policy",
+        required=True,
+        choices=("reuse", "overwrite"),
+        help=(
+            "Reuse existing compatible per-worker SVD artifacts and calculate only "
+            "missing jobs, or overwrite all artifacts for this run. Artifacts are "
+            "stored under <output>.svd-artifacts"
+        ),
+    )
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
+        "--save-selected-tokens",
+        metavar="PATH",
+        help="Save the global token positions selected during this run as JSON",
+    )
+    selection_group.add_argument(
+        "--load-selected-tokens",
+        metavar="PATH",
+        help="Load and reuse global token positions from a previous run",
+    )
+    selection_group.add_argument(
+        "--selected-tokens-cache",
+        metavar="PATH",
+        help=(
+            "Load global token positions when PATH exists; otherwise select tokens "
+            "and save them to PATH"
+        ),
+    )
+    return parser
+
+
+def run():
+    parser = create_argument_parser()
 
     args = parser.parse_args()
 
@@ -768,8 +1587,6 @@ def run():
     log_level = args.log_level
     sampling_policy = TensorFileManager.SamplingPolicy[args.sampling_policy.upper()]
 
-    Rope.load_model_config(args.model_dir)
-
     init_logger(
         log_dir,
         f"svd-q{svd_dim}_iter{svd_iter}_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.log",
@@ -777,38 +1594,171 @@ def run():
     )
 
     input_dir_list, workers = discover_dump_directories(input_dir)
+    svd_workers = min(SVD_WORKERS, len(workers) * len(TensorFileManager.KV))
 
-    output_dict = {
-        "version": KVTC_FILE_VERSION,
-        "keys": {worker: {"mu": None, "basis": None} for worker in workers},
-        "values": {worker: {"mu": None, "basis": None} for worker in workers},
+    available_cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    torch.set_num_threads(available_cpus)
+
+    tensor_managers = {
+        worker: TensorFileManager(input_dir_list, worker, sampling_policy)
+        for worker in workers
     }
+    Rope.load_model_config(args.model_dir)
+    global_sampling_requests = build_global_sampling_requests(
+        tensor_managers, workers, N
+    )
+
+    cache_metadata = build_svd_cache_metadata(
+        input_dir=input_dir,
+        model_dir=Path(args.model_dir),
+        dump_directories=input_dir_list,
+        workers=workers,
+        sampling_requests=global_sampling_requests,
+        sample_tokens=N,
+        sampling_policy=sampling_policy,
+        svd_dim=svd_dim,
+        svd_iter=svd_iter,
+    )
+    svd_cache_directory = build_svd_cache_directory(output_path, cache_metadata)
+
+    selection_mode = None
+    selection_path = None
+    if args.save_selected_tokens:
+        selection_mode = "save"
+        selection_path = Path(args.save_selected_tokens)
+    elif args.load_selected_tokens:
+        selection_mode = "load"
+        selection_path = Path(args.load_selected_tokens)
+    elif args.selected_tokens_cache:
+        selection_path = Path(args.selected_tokens_cache)
+        selection_mode = "load" if selection_path.exists() else "save"
+    else:
+        selection_path = svd_cache_directory / "selected-tokens.json"
+        selection_mode = "load" if selection_path.exists() else "save"
+
+    logger.info(
+        "Token selection cache %s; %s selections at %s",
+        "exists" if selection_path.exists() else "does not exist",
+        "loading" if selection_mode == "load" else "saving new",
+        selection_path,
+    )
+    if selection_path.absolute() == output_path.absolute():
+        parser.error("The token selection path must differ from --output")
+
+    selection_store = TokenSelectionStore(
+        mode=selection_mode,
+        path=selection_path,
+        input_dir=input_dir,
+        model_dir=Path(args.model_dir),
+        sample_tokens=N,
+        sampling_policy=sampling_policy,
+        dump_directories=input_dir_list,
+        workers=workers,
+    )
+    # Keep selection finalization and persistence ahead of all SVD worker creation.
+    selection_store.finalize(global_sampling_requests)
+    selection_digest = selection_store.digest()
+    artifact_directory = svd_cache_directory / f"selection-{selection_digest}"
+    logger.info(
+        "SVD artifact directory for current sampling/SVD parameters: %s",
+        artifact_directory,
+    )
+
+    # This is the authoritative mapping between an SVD artifact and its final
+    # output index. Never infer this mapping from completion or directory order.
+    jobs = {}
+    for worker in workers:
+        for kv in TensorFileManager.KV:
+            pair = (worker, kv)
+            metadata = build_svd_job_metadata(
+                cache_metadata, selection_digest, worker, kv
+            )
+            artifact_path = artifact_directory / f"{worker}-{kv.name}.pt"
+            temporary_path = artifact_path.with_name(
+                f".{artifact_path.name}.tmp-{os.getpid()}"
+            )
+            if pair in jobs:
+                raise SVDArtifactError(f"Duplicate SVD job index: {pair}")
+            jobs[pair] = {
+                "path": artifact_path,
+                "temporary_path": temporary_path,
+                "metadata": metadata,
+            }
 
     logger.info(
         f"-------------------- model={args.model_dir} N={N} q={svd_dim} iter={svd_iter} --------------------"
     )
+    logger.info(
+        "Running up to %d SVD jobs concurrently with up to %d PyTorch intra-op threads",
+        svd_workers,
+        available_cpus,
+    )
 
-    for worker in workers:
-        tensor_manager = TensorFileManager(input_dir_list, worker, sampling_policy)
-        for kv in TensorFileManager.KV:
-            undo_rope = kv == TensorFileManager.KV.K
+    jobs_to_run = select_svd_jobs(workers, jobs, args.svd_cache_policy)
+
+    if jobs_to_run:
+        with ThreadPoolExecutor(
+            max_workers=svd_workers, thread_name_prefix="svd"
+        ) as executor:
+            future_jobs = {
+                executor.submit(
+                    run_svd_job,
+                    tensor_managers[worker],
+                    selection_store,
+                    worker,
+                    kv,
+                    svd_dim,
+                    svd_iter,
+                    job["path"],
+                    job["temporary_path"],
+                    job["metadata"],
+                ): (worker, kv, job["path"])
+                for worker, kv, job in jobs_to_run
+            }
+
+            completed_jobs = 0
             try:
-                mu, U, S, V = SVD(
-                    tensor_manager, svd_dim, svd_iter, kv, N, undo_rope
+                for future in as_completed(future_jobs):
+                    expected_worker, expected_kv, expected_path = future_jobs[future]
+                    worker, kv, artifact_path = future.result()
+                    if (
+                        worker != expected_worker
+                        or kv != expected_kv
+                        or artifact_path != expected_path
+                    ):
+                        raise SVDArtifactError(
+                            "SVD future returned a result for the wrong final index: "
+                            f"expected {(expected_worker, expected_kv, expected_path)}, "
+                            f"got {(worker, kv, artifact_path)}"
+                        )
+                    completed_jobs += 1
+            except Exception:
+                for future in future_jobs:
+                    future.cancel()
+                logger.exception(
+                    "SVD calibration failed after confirming %d of %d scheduled "
+                    "artifacts; rerun with --svd-cache-policy reuse to resume",
+                    completed_jobs,
+                    len(jobs_to_run),
                 )
-                logger.info(f"{mu.shape=}\n{U.shape=}\n{S.shape=}\n{V.shape=}")
-                if kv == TensorFileManager.KV.K:
-                    output_dict["keys"][worker]["basis"] = V
-                    output_dict["keys"][worker]["mu"] = mu
-                elif kv == TensorFileManager.KV.V:
-                    output_dict["values"][worker]["basis"] = V
-                    output_dict["values"][worker]["mu"] = mu
+                raise
 
-            except RuntimeError as e:
-                logger.exception('')
-                return
+    missing_artifacts = [
+        job["path"] for job in jobs.values() if not job["path"].is_file()
+    ]
+    if missing_artifacts:
+        raise SVDArtifactError(
+            f"Cannot assemble final output; missing SVD artifacts: {missing_artifacts}"
+        )
 
-        torch.save(output_dict, output_path)
+    # Load output matrices only after every SVD artifact has been published and
+    # all SVD scratch tensors have been released.
+    output_dict = assemble_svd_output(workers, jobs)
+    torch.save(output_dict, output_path)
 
 
 if __name__ == "__main__":
