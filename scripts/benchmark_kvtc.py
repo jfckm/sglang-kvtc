@@ -5,6 +5,14 @@ Run in the same Ascend/PyTorch environment used to launch SGLang. Setup and
 validation are untimed. All measurements include Python and device work; no
 model graph is captured. The default modes compare production configurations,
 which can retain different PCA ranks, rather than isolated quantizer arithmetic.
+
+Add --profile to capture Ascend CPU/NPU traces instead of latency measurements.
+For a short smoke run, reuse your normal input arguments and add:
+    --profile --tokens 256 --warmups 1 --profile-iterations 1
+Traces go under ./kvtc_profiles/<unique-run>/<mode>/<offload|reload>/.
+Inspect trace_view.json in a trace viewer or the exported operator summaries.
+The kvtc/* ranges label CPU scopes with correlated NPU operations; their CPU
+durations alone are not device-stage latency measurements.
 """
 
 from __future__ import annotations
@@ -17,9 +25,11 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +134,18 @@ def build_parser():
         help=("Production host-pool size in decimal GB; "
               "automatically size for all modes when omitted, minimum 10 GB"),
     )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Collect CPU/NPU traces instead of benchmark timings; --iterations is unused",
+    )
+    parser.add_argument(
+        "--profile-iterations", type=int, default=1,
+        help="Captured iterations per enabled mode and direction when --profile is set",
+    )
+    parser.add_argument(
+        "--profile-dir", type=Path, default=Path("kvtc_profiles"),
+        help="Trace output parent; each profiling run creates a unique subdirectory",
+    )
     return parser
 
 
@@ -138,6 +160,8 @@ def validate_args(parser, args):
         parser.error("--page-size must be a positive divisor of 128")
     if args.iterations <= 0 or args.warmups < 0:
         parser.error("--iterations must be positive and --warmups must be nonnegative")
+    if args.profile_iterations <= 0:
+        parser.error("--profile-iterations must be positive")
     if args.tokens is not None and args.tokens <= 0:
         parser.error("--tokens must be positive")
     if args.device < 0 or not WORKER_PATTERN.fullmatch(args.tp_worker_name):
@@ -389,6 +413,76 @@ def reload_all_layers(pool, request, layer_count):
         pool.load_to_device_per_layer(request)
 
 
+def create_profile_directory(parent):
+    parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(
+        prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=parent.resolve()
+    ))
+
+
+def profile_operation(operation, host, warmups, iterations, directory, label):
+    """Capture only warmed-up transfers; never use profiler timings as benchmarks."""
+    import torch
+    import torch_npu
+
+    pools = (host, host.compressed_pool)
+    for pool in pools:
+        pool._profile_kvtc = False
+    try:
+        for _ in range(warmups):
+            torch.npu.synchronize()
+            operation()
+            torch.npu.synchronize()
+        directory.mkdir(parents=True, exist_ok=True)
+        profiler = torch_npu.profiler
+        config = profiler._ExperimentalConfig(
+            profiler_level=profiler.ProfilerLevel.Level1,
+            export_type=[profiler.ExportType.Text],
+        )
+        torch.npu.synchronize()
+        with profiler.profile(
+            activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            experimental_config=config,
+            on_trace_ready=profiler.tensorboard_trace_handler(
+                str(directory), async_mode=False,
+            ),
+        ) as capture:
+            for pool in pools:
+                pool._profile_kvtc = True
+            try:
+                for iteration in range(iterations):
+                    torch.npu.synchronize()
+                    with torch.profiler.record_function(f"kvtc/{label}/iteration_{iteration}"):
+                        operation()
+                        # Completion belongs to the iteration, not to individual stages.
+                        with torch.profiler.record_function("kvtc/iteration_wait"):
+                            torch.npu.synchronize()
+                    capture.step()
+            finally:
+                for pool in pools:
+                    pool._profile_kvtc = False
+    finally:
+        # Also covers warmup, profiler construction, and export failures.
+        for pool in pools:
+            pool._profile_kvtc = False
+    return str(directory)
+
+
+def run_direction(args, mode, direction, operation, host):
+    if args.profile:
+        return profile_operation(
+            operation, host, args.warmups, args.profile_iterations,
+            args.profile_run_dir / mode.name / direction,
+            f"{mode.name}/{direction}",
+        )
+    import torch
+
+    return measure(operation, args.warmups, args.iterations, torch.npu.synchronize)
+
+
 def git_version():
     try:
         commit = subprocess.check_output(
@@ -486,9 +580,9 @@ def run_mode(args, mode, device_pool, keys, values, rotary_emb):
     # wrappers. Synchronization at measurement boundaries waits for completion.
     write_stream, load_stream = torch.npu.Stream(), torch.npu.Stream()
     with torch.npu.stream(write_stream):
-        offload = measure(
-            lambda: host.backup_from_device_all_layer(request),
-            args.warmups, args.iterations, torch.npu.synchronize,
+        offload = run_direction(
+            args, mode, "offload",
+            lambda: host.backup_from_device_all_layer(request), host,
         )
     # Erase the destination once outside timing: validation must prove that the
     # reload really wrote the data rather than finding the original input there.
@@ -496,9 +590,9 @@ def run_mode(args, mode, device_pool, keys, values, rotary_emb):
     device_pool.v_buffer[:, 1:].fill_(float("nan"))
     torch.npu.synchronize()
     with torch.npu.stream(load_stream):
-        reload = measure(
-            lambda: reload_all_layers(host, request, device_pool.layer_num),
-            args.warmups, args.iterations, torch.npu.synchronize,
+        reload = run_direction(
+            args, mode, "reload",
+            lambda: reload_all_layers(host, request, device_pool.layer_num), host,
         )
     validation = check_reconstruction(device_pool, keys, values, args.page_size, mode.name)
     return {"offload": offload, "reload": reload}, validation
@@ -532,16 +626,28 @@ def print_results(results, tokens, logical_bytes):
     print(format_results(results, tokens, logical_bytes), flush=True)
 
 
-def print_final_report(metadata, validations, results, tokens, logical_bytes):
+def print_final_report(metadata, validations, results, tokens, logical_bytes, *, profiling=False):
     # Reuse captured settings, including the original commit and resolved
     # defaults. One print keeps the copyable report together after framework logs.
+    kind = "PROFILE" if profiling else "BENCHMARK"
+    if profiling:
+        output = "\n".join([
+            "\nTrace directories (CPU/NPU timeline and operator summaries):",
+            *(f"  {mode}/{direction}: {path}"
+              for mode, directions in results.items() for direction, path in directions.items()),
+            "Stage ranges describe CPU scopes and correlated NPU work; "
+            "stages are not individually synchronized.",
+            "No benchmark timings or speedups were measured in profiling mode.",
+        ])
+    else:
+        output = format_results(results, tokens, logical_bytes)
     report = "\n".join([
-        "\n========== KVTC BENCHMARK REPORT ==========",
+        f"\n========== KVTC {kind} REPORT ==========",
         *metadata,
         "\nReconstruction checks (outside timing):",
         *validations,
-        format_results(results, tokens, logical_bytes),
-        "========== END KVTC BENCHMARK REPORT ==========",
+        output,
+        f"========== END KVTC {kind} REPORT ==========",
     ])
     print(report, flush=True)
 
@@ -581,7 +687,17 @@ def run():
         f"Sink tokens: {SINK_TOKENS}; remaining tokens: {tokens - SINK_TOKENS}; "
         f"page size: {args.page_size}"
     )
-    info(f"Iterations: {args.iterations}; warmups: {args.warmups} (each direction, each mode)")
+    if args.profile:
+        args.profile_run_dir = create_profile_directory(args.profile_dir)
+        info(
+            f"Execution: profiling only; captured iterations: {args.profile_iterations}; "
+            f"warmups: {args.warmups} (each direction, each mode); "
+            f"--iterations={args.iterations} is unused"
+        )
+        info(f"Profile output: {args.profile_run_dir}")
+        info("Profiler: CPU+NPU, Level1, shapes on, memory/stacks off, synchronous export")
+    else:
+        info(f"Iterations: {args.iterations}; warmups: {args.warmups} (each direction, each mode)")
     info(f"Enabled modes: {', '.join(enabled_modes(args))}")
     info(
         f"Device: npu:{args.device} ({torch.npu.get_device_name(args.device)}); "
@@ -648,6 +764,7 @@ def run():
     print_final_report(
         metadata, validations, results, tokens,
         raw_page_bytes * (tokens // args.page_size),
+        profiling=args.profile,
     )
 
 
