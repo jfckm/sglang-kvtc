@@ -294,7 +294,7 @@ def resolve_ratio(params, requested, option):
     raise ValueError(f"Pass {option}; available artifact ratios: {available}")
 
 
-def describe_modes(args, shape, dtype):
+def describe_modes(args, shape, dtype, report=print):
     import torch
 
     from sglang.srt.mem_cache.kvtc_quant import build_quant_layout, quant_group_bits
@@ -351,7 +351,7 @@ def describe_modes(args, shape, dtype):
                 page_bytes += args.page_size * sum(
                     quant_group_bits(size, storage) for size, storage in schema
                 ) // 8
-                print(f"  quant {side} schema: {schema}", flush=True)
+                report(f"  quant {side} schema: {schema}")
         modes.append(Mode(name, page_bytes, *ranks, *groups))
     return modes, raw_page_bytes
 
@@ -431,7 +431,9 @@ def check_reconstruction(device_pool, keys, values, page_size, mode):
             energy += reference.float().square().sum(dtype=torch.float64).item()
         relative = math.sqrt(error / energy) if energy else (0.0 if error == 0 else math.inf)
         checks.append(f"{name} relative-L2={relative:.6g}")
-    print(f"  {mode} validation: finite, sink exact; " + ", ".join(checks), flush=True)
+    validation = f"  {mode} validation: finite, sink exact; " + ", ".join(checks)
+    print(validation, flush=True)
+    return validation
 
 
 def run_mode(args, mode, device_pool, keys, values, rotary_emb):
@@ -498,17 +500,18 @@ def run_mode(args, mode, device_pool, keys, values, rotary_emb):
             lambda: reload_all_layers(host, request, device_pool.layer_num),
             args.warmups, args.iterations, torch.npu.synchronize,
         )
-    check_reconstruction(device_pool, keys, values, args.page_size, mode.name)
-    return {"offload": offload, "reload": reload}
+    validation = check_reconstruction(device_pool, keys, values, args.page_size, mode.name)
+    return {"offload": offload, "reload": reload}, validation
 
 
-def print_results(results, tokens, logical_bytes):
-    print("\nCompleted-operation wall time (setup, warmups and validation excluded)")
-    print("Logical GiB/s uses original K+V bytes; speedup = baseline median / mode median.")
-    print(
+def format_results(results, tokens, logical_bytes):
+    lines = [
+        "\nCompleted-operation wall time (setup, warmups and validation excluded)",
+        "Logical GiB/s uses original K+V bytes; speedup = baseline median / mode median.",
         f"{'Mode':<12} {'Direction':<8} {'Mean ms':>10} {'Median ms':>10} "
-        f"{'Min ms':>10} {'P95 ms':>10} {'Tokens/s':>12} {'GiB/s':>10} {'Speedup':>9}"
-    )
+        f"{'Min ms':>10} {'Max ms':>10} {'P95 ms':>10} "
+        f"{'Tokens/s':>12} {'GiB/s':>10} {'Speedup':>9}",
+    ]
     for name, directions in results.items():
         for direction, samples in directions.items():
             median = statistics.median(samples)
@@ -516,12 +519,31 @@ def print_results(results, tokens, logical_bytes):
             speedup = f"{statistics.median(baseline) / median:.3f}x" if baseline else "n/a"
             p95 = sorted(samples)[math.ceil(0.95 * len(samples)) - 1]
             seconds = median / 1000
-            print(
+            lines.append(
                 f"{name:<12} {direction:<8} {statistics.mean(samples):10.3f} "
-                f"{median:10.3f} {min(samples):10.3f} {p95:10.3f} "
+                f"{median:10.3f} {min(samples):10.3f} {max(samples):10.3f} {p95:10.3f} "
                 f"{tokens / seconds:12.1f} {logical_bytes / 2**30 / seconds:10.3f} "
                 f"{speedup:>9}"
             )
+    return "\n".join(lines)
+
+
+def print_results(results, tokens, logical_bytes):
+    print(format_results(results, tokens, logical_bytes), flush=True)
+
+
+def print_final_report(metadata, validations, results, tokens, logical_bytes):
+    # Reuse captured settings, including the original commit and resolved
+    # defaults. One print keeps the copyable report together after framework logs.
+    report = "\n".join([
+        "\n========== KVTC BENCHMARK REPORT ==========",
+        *metadata,
+        "\nReconstruction checks (outside timing):",
+        *validations,
+        format_results(results, tokens, logical_bytes),
+        "========== END KVTC BENCHMARK REPORT ==========",
+    ])
+    print(report, flush=True)
 
 
 def run():
@@ -542,30 +564,36 @@ def run():
     dump = select_dump(discover_dumps(args.dump_dir, args.tp_worker_name), args.dump_name)
     tokens = selected_token_count(dump.token_count, args.tokens, args.page_size)
     requested = dump.token_count if args.tokens is None else args.tokens
-    print(f"\nSGLang commit: {git_version()}")
-    print(f"Model: {args.model_dir}\nCompression artifact: {args.compression_matrix}")
-    print(f"Dump: {dump.name}\nDump directory: {dump.directory}\nTP worker: {args.tp_worker_name}")
-    print(
+    metadata = []
+
+    def info(message):
+        metadata.append(message)
+        print(message, flush=True)
+
+    info(f"\nSGLang commit: {git_version()}")
+    info(f"Model: {args.model_dir}\nCompression artifact: {args.compression_matrix}")
+    info(f"Dump: {dump.name}\nDump directory: {dump.directory}\nTP worker: {args.tp_worker_name}")
+    info(
         f"Tokens: original={dump.token_count}, requested={requested}, actual={tokens}, "
         f"dropped by rounding={requested - tokens}"
     )
-    print(
+    info(
         f"Sink tokens: {SINK_TOKENS}; remaining tokens: {tokens - SINK_TOKENS}; "
         f"page size: {args.page_size}"
     )
-    print(f"Iterations: {args.iterations}; warmups: {args.warmups} (each direction, each mode)")
-    print(f"Enabled modes: {', '.join(enabled_modes(args))}")
-    print(
+    info(f"Iterations: {args.iterations}; warmups: {args.warmups} (each direction, each mode)")
+    info(f"Enabled modes: {', '.join(enabled_modes(args))}")
+    info(
         f"Device: npu:{args.device} ({torch.npu.get_device_name(args.device)}); "
-        f"torch={torch.__version__}; torch_npu={torch_npu.__version__}", flush=True,
+        f"torch={torch.__version__}; torch_npu={torch_npu.__version__}",
     )
 
     keys, values = load_selected_dump(dump, tokens)
-    print(
+    info(
         f"Selected tensor shape [token, layer, head, head_dim]: {tuple(keys.shape)}; "
-        f"dtype={keys.dtype}", flush=True,
+        f"dtype={keys.dtype}",
     )
-    modes, raw_page_bytes = describe_modes(args, keys.shape, keys.dtype)
+    modes, raw_page_bytes = describe_modes(args, keys.shape, keys.dtype, report=info)
     required = required_host_gb(tokens, args.page_size, modes, raw_page_bytes)
     if args.host_memory_gb is None:
         args.host_memory_gb = required
@@ -574,21 +602,21 @@ def run():
             f"This workload requires --host-memory-gb >= {required} "
             "with the production 90/10 split"
         )
-    print(f"Host allocation parameter: {args.host_memory_gb} decimal GB (production 90/10 split)")
-    print(f"K compression ratio: {args.k_cr}; V compression ratio: {args.v_cr}")
+    info(f"Host allocation parameter: {args.host_memory_gb} decimal GB (production 90/10 split)")
+    info(f"K compression ratio: {args.k_cr}; V compression ratio: {args.v_cr}")
     for mode in modes:
         stored_bytes = (
             raw_page_bytes * (SINK_TOKENS // args.page_size)
             + mode.page_bytes * ((tokens - SINK_TOKENS) // args.page_size)
         )
-        print(
+        info(
             f"  {mode.name}: retained K/V rank={mode.k_rank}/{mode.v_rank}, "
             f"K/V groups={mode.k_groups}/{mode.v_groups}, "
             f"remaining-page bytes={mode.page_bytes}, stored workload bytes={stored_bytes}"
         )
-    print(
+    info(
         "Assumptions: BF16 MHA dump; positions start at 0; 128 sink tokens; "
-        "no inference overlap or graph capture.", flush=True,
+        "no inference overlap or graph capture.",
     )
 
     rotary_emb = None
@@ -609,11 +637,18 @@ def run():
         if not isinstance(device_pool.k_buffer, torch.Tensor) or device_pool.k_buffer.ndim != 5:
             raise ValueError("Benchmark requires the paged NPU layout; unset ASCEND_USE_FIA")
         results = {}
+        validations = []
         for mode in modes:
-            results[mode.name] = run_mode(args, mode, device_pool, keys, values, rotary_emb)
+            results[mode.name], validation = run_mode(
+                args, mode, device_pool, keys, values, rotary_emb
+            )
+            validations.append(validation)
             gc.collect()
             torch.npu.empty_cache()
-    print_results(results, tokens, raw_page_bytes * (tokens // args.page_size))
+    print_final_report(
+        metadata, validations, results, tokens,
+        raw_page_bytes * (tokens // args.page_size),
+    )
 
 
 if __name__ == "__main__":
