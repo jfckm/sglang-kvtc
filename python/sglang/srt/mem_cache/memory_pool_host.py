@@ -3291,6 +3291,8 @@ class DSAIndexerPoolHost(HostKVCache):
 class NPUMHATokenToKVPoolCompressed(HostKVCache):
     # Temporary KVTC trace annotations; disabled path creates no contexts.
     _profile_kvtc = False
+    # Bound the projected pages retained on the NPU before quantization/offload.
+    _QUANT_BATCH_MAX_PAGES = 32
 
     _QUANT_STORAGE_DTYPES = KVTC_QUANT_STORAGE_DTYPES
     _QUANT_PRECISION_BITS = KVTC_QUANT_PRECISION_BITS
@@ -3728,6 +3730,36 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         scales: torch.Tensor,
         offsets: torch.Tensor,
     ) -> None:
+        # Keep the single-page entry point for reconstruction/debugging tools.
+        NPUMHATokenToKVPoolCompressed._quantize_pages(
+            self,
+            X.unsqueeze(0),
+            torch.as_tensor(host_page, device="cpu", dtype=torch.int64).reshape(1),
+            layout,
+            payload_buffers,
+            scales,
+            offsets,
+        )
+
+    def _quantize_pages(
+        self,
+        X: torch.Tensor,
+        host_pages: torch.Tensor,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        """Quantize [pages, tokens, features], preserving the per-page wire layout.
+
+        host_pages contains CPU int64 destination page IDs in X's page order.
+        Quantization reduces only the feature dimension, so every token/group
+        retains its own scale and offset even when pages are batched together.
+        """
+        num_pages = X.shape[0]
+        if num_pages == 0:
+            return
+        X = X.flatten(0, 1)
         quantized_by_dtype = defaultdict(list)
         group_scales = []
         group_offsets = []
@@ -3739,13 +3771,13 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/quant/float_payload"):
                         quantized_by_dtype[group.dtype_name].append(
-                            group_values.reshape(-1).to(
+                            group_values.reshape(num_pages, -1).to(
                                 dtype=self._QUANT_STORAGE_DTYPES[group.dtype_name]
                             )
                         )
                 else:
                     quantized_by_dtype[group.dtype_name].append(
-                        group_values.reshape(-1).to(
+                        group_values.reshape(num_pages, -1).to(
                             dtype=self._QUANT_STORAGE_DTYPES[group.dtype_name]
                         )
                     )
@@ -3769,52 +3801,59 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/quant/metadata_prepare"):
-                    quantized_by_dtype[group.dtype_name].append(quantized.reshape(-1))
-                    group_scales.append(scale.reshape(self.page_size))
+                    quantized_by_dtype[group.dtype_name].append(
+                        quantized.reshape(num_pages, -1)
+                    )
+                    group_scales.append(scale.reshape(num_pages, self.page_size))
                     # npu_anti_quant computes (q + offset) * scale, while the dynamic
                     # quantizer returns q = round(x / scale + offset).
-                    group_offsets.append((-quant_offset).reshape(self.page_size))
+                    group_offsets.append(
+                        (-quant_offset).reshape(num_pages, self.page_size)
+                    )
             else:
-                quantized_by_dtype[group.dtype_name].append(quantized.reshape(-1))
-                group_scales.append(scale.reshape(self.page_size))
+                quantized_by_dtype[group.dtype_name].append(
+                    quantized.reshape(num_pages, -1)
+                )
+                group_scales.append(scale.reshape(num_pages, self.page_size))
                 # npu_anti_quant computes (q + offset) * scale, while the dynamic
                 # quantizer returns q = round(x / scale + offset).
-                group_offsets.append((-quant_offset).reshape(self.page_size))
+                group_offsets.append((-quant_offset).reshape(num_pages, self.page_size))
 
+        # Concatenate within each page, not across flattened page/group pairs.
         for dtype_name, chunks in quantized_by_dtype.items():
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/quant/pack_payload_d2h"):
-                    payload_buffers[dtype_name][host_page].copy_(
-                        torch.cat(chunks).to(device=self.device)
-                    )
+                    host_payload = torch.cat(chunks, dim=1).to(device=self.device)
             else:
-                payload_buffers[dtype_name][host_page].copy_(
-                    torch.cat(chunks).to(device=self.device)
-                )
+                host_payload = torch.cat(chunks, dim=1).to(device=self.device)
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/quant/payload_host_scatter"):
+                    payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
+            else:
+                payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
         if group_scales:
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/quant/pack_metadata_d2h"):
-                    scales[host_page].copy_(
-                        torch.stack(group_scales, dim=1).to(
-                            device=self.device, dtype=self._QUANT_METADATA_DTYPE
-                        )
+                    host_scales = torch.stack(group_scales, dim=2).to(
+                        device=self.device, dtype=self._QUANT_METADATA_DTYPE
                     )
-                    offsets[host_page].copy_(
-                        torch.stack(group_offsets, dim=1).to(
-                            device=self.device, dtype=self._QUANT_METADATA_DTYPE
-                        )
+                    host_offsets = torch.stack(group_offsets, dim=2).to(
+                        device=self.device, dtype=self._QUANT_METADATA_DTYPE
                     )
             else:
-                scales[host_page].copy_(
-                    torch.stack(group_scales, dim=1).to(
-                        device=self.device, dtype=self._QUANT_METADATA_DTYPE
-                    )
+                host_scales = torch.stack(group_scales, dim=2).to(
+                    device=self.device, dtype=self._QUANT_METADATA_DTYPE
                 )
-                offsets[host_page].copy_(
-                    torch.stack(group_offsets, dim=1).to(
-                        device=self.device, dtype=self._QUANT_METADATA_DTYPE
-                    )
+                host_offsets = torch.stack(group_offsets, dim=2).to(
+                    device=self.device, dtype=self._QUANT_METADATA_DTYPE
                 )
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/quant/metadata_host_scatter"):
+                    scales.index_copy_(0, host_pages, host_scales)
+                    offsets.index_copy_(0, host_pages, host_offsets)
+            else:
+                scales.index_copy_(0, host_pages, host_scales)
+                offsets.index_copy_(0, host_pages, host_offsets)
 
     def _dequantize_page(
         self,
@@ -4208,6 +4247,9 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         else:
             token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
+        projected_k_pages = []
+        projected_v_pages = []
+        batch_start = 0
         for page in range(num_pages):
             host_page = host_indices[page * self.page_size] // self.page_size
             device_page = device_indices[page * self.page_size] // self.page_size
@@ -4240,34 +4282,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     else:
                         self.k_buffer[host_page] = D_k.to(device=self.device)
                 else:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/K/quantize"):
-                            self._quantize_page(
-                                D_k,
-                                host_page,
-                                self.k_quant_layout,
-                                self.k_quant_buffers,
-                                self.k_quant_scales,
-                                self.k_quant_offsets,
-                            )
-                    else:
-                        self._quantize_page(
-                            D_k,
-                            host_page,
-                            self.k_quant_layout,
-                            self.k_quant_buffers,
-                            self.k_quant_scales,
-                            self.k_quant_offsets,
-                        )
-                    self._log_quant_page_diagnostics(
-                        "K",
-                        D_k,
-                        host_page,
-                        self.k_quant_layout,
-                        self.k_quant_buffers,
-                        self.k_quant_scales,
-                        self.k_quant_offsets,
-                    )
+                    projected_k_pages.append(D_k)
             else:
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/K/raw_d2h"):
@@ -4305,34 +4320,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     else:
                         self.v_buffer[host_page] = D_v.to(device=self.device)
                 else:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/V/quantize"):
-                            self._quantize_page(
-                                D_v,
-                                host_page,
-                                self.v_quant_layout,
-                                self.v_quant_buffers,
-                                self.v_quant_scales,
-                                self.v_quant_offsets,
-                            )
-                    else:
-                        self._quantize_page(
-                            D_v,
-                            host_page,
-                            self.v_quant_layout,
-                            self.v_quant_buffers,
-                            self.v_quant_scales,
-                            self.v_quant_offsets,
-                        )
-                    self._log_quant_page_diagnostics(
-                        "V",
-                        D_v,
-                        host_page,
-                        self.v_quant_layout,
-                        self.v_quant_buffers,
-                        self.v_quant_scales,
-                        self.v_quant_offsets,
-                    )
+                    projected_v_pages.append(D_v)
             else:
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/V/raw_d2h"):
@@ -4343,6 +4331,101 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     self.v_buffer[:, host_page, ...] = device_pool.v_buffer[:, device_page, ...].to(
                         device=self.device
                     )
+
+            if (projected_k_pages or projected_v_pages) and (
+                page + 1 - batch_start == self._QUANT_BATCH_MAX_PAGES
+                or page + 1 == num_pages
+            ):
+                if self._profile_kvtc:
+                    with torch.profiler.record_function("kvtc/quant/host_indices"):
+                        host_pages = (
+                            host_indices[
+                                batch_start * self.page_size : (page + 1)
+                                * self.page_size : self.page_size
+                            ]
+                            // self.page_size
+                        ).to(device="cpu", dtype=torch.int64)
+                else:
+                    host_pages = (
+                        host_indices[
+                            batch_start * self.page_size : (page + 1)
+                            * self.page_size : self.page_size
+                        ]
+                        // self.page_size
+                    ).to(device="cpu", dtype=torch.int64)
+                if projected_k_pages:
+                    if self._profile_kvtc:
+                        with torch.profiler.record_function("kvtc/K/quantize"):
+                            self._backup_quantized_batch(
+                                "K",
+                                projected_k_pages,
+                                host_pages,
+                                self.k_quant_layout,
+                                self.k_quant_buffers,
+                                self.k_quant_scales,
+                                self.k_quant_offsets,
+                            )
+                    else:
+                        self._backup_quantized_batch(
+                            "K",
+                            projected_k_pages,
+                            host_pages,
+                            self.k_quant_layout,
+                            self.k_quant_buffers,
+                            self.k_quant_scales,
+                            self.k_quant_offsets,
+                        )
+                if projected_v_pages:
+                    if self._profile_kvtc:
+                        with torch.profiler.record_function("kvtc/V/quantize"):
+                            self._backup_quantized_batch(
+                                "V",
+                                projected_v_pages,
+                                host_pages,
+                                self.v_quant_layout,
+                                self.v_quant_buffers,
+                                self.v_quant_scales,
+                                self.v_quant_offsets,
+                            )
+                    else:
+                        self._backup_quantized_batch(
+                            "V",
+                            projected_v_pages,
+                            host_pages,
+                            self.v_quant_layout,
+                            self.v_quant_buffers,
+                            self.v_quant_scales,
+                            self.v_quant_offsets,
+                        )
+                batch_start = page + 1
+
+    def _backup_quantized_batch(
+        self,
+        matrix_name: str,
+        projected_pages: list[torch.Tensor],
+        host_pages: torch.Tensor,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        if self._profile_kvtc:
+            with torch.profiler.record_function("kvtc/quant/batch_assemble"):
+                X = torch.stack(projected_pages)
+                projected_pages.clear()
+        else:
+            X = torch.stack(projected_pages)
+            projected_pages.clear()
+        self._quantize_pages(X, host_pages, layout, payload_buffers, scales, offsets)
+        self._log_quant_page_diagnostics(
+            matrix_name,
+            X[0],
+            host_pages[0],
+            layout,
+            payload_buffers,
+            scales,
+            offsets,
+        )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         raise NotImplementedError()
