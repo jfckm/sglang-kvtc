@@ -4254,7 +4254,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                                 * self.page_size : self.page_size
                             ]
                             // self.page_size
-                        ).to(device=device_pool.device, dtype=torch.int64)
+                        ).to(device=device_pool.device, dtype=torch.int64, non_blocking=True)
                 else:
                     device_pages = (
                         device_indices[
@@ -4262,7 +4262,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                             * self.page_size : self.page_size
                         ]
                         // self.page_size
-                    ).to(device=device_pool.device, dtype=torch.int64)
+                    ).to(device=device_pool.device, dtype=torch.int64, non_blocking=True)
 
             if D_k_pages is not None:
                 if self._profile_kvtc:
