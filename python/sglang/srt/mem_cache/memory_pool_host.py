@@ -3333,6 +3333,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.kvtc_quant_debug = kvtc_quant_debug
         self._kvtc_quant_debugged_pages = set()
         self._kvtc_quant_debugged_activity = set()
+        self._kvtc_dequant_metadata_cache = {}
         if self.kvtc_quant_disable:
             self._validate_pca_storage_dtype(self.compressed_dtype)
         self.rotary_emb = rotary_emb
@@ -3871,6 +3872,41 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             offsets,
         )[0]
 
+    def _get_dequant_metadata_plan(
+        self,
+        layout: _KVTCQuantLayout,
+        dtype_name: str,
+        dtype_groups: list[tuple[int, _KVTCQuantGroup]],
+        num_pages: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached metadata gather indices and repeat counts."""
+        cache = getattr(self, "_kvtc_dequant_metadata_cache", None)
+        if cache is None:
+            cache = self._kvtc_dequant_metadata_cache = {}
+
+        key = (id(layout), dtype_name, num_pages, str(device))
+        cached = cache.get(key)
+        if cached is not None and cached[0] is layout:
+            return cached[1], cached[2]
+
+        metadata_indices = torch.tensor(
+            [group.metadata_index for _, group in dtype_groups],
+            dtype=torch.int64,
+            device=device,
+        )
+        repeat_counts = torch.tensor(
+            [
+                group.feature_end - group.feature_start
+                for _, group in dtype_groups
+                for _ in range(self.page_size)
+            ],
+            dtype=torch.int64,
+            device=device,
+        ).repeat(num_pages)
+        cache[key] = (layout, metadata_indices, repeat_counts)
+        return metadata_indices, repeat_counts
+
     def _dequantize_pages(
         self,
         host_pages: torch.Tensor,
@@ -3918,80 +3954,77 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             }
             device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
             device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
-        if self._profile_kvtc:
-            with torch.profiler.record_function("kvtc/dequant/allocate_projection"):
-                X = torch.empty(
-                    (num_pages, self.page_size, layout.feature_count),
-                    dtype=torch.float32,
-                    device=device,
-                )
-        else:
-            X = torch.empty(
-                (num_pages, self.page_size, layout.feature_count),
-                dtype=torch.float32,
-                device=device,
-            )
+        # Each dtype buffer is already packed page-major, then group-major, by
+        # _quantize_pages().  Keep one flattened anti-quant input per dtype;
+        # reshape/view below does not launch a device kernel.
+        groups_by_dtype = defaultdict(list)
+        for group_index, group in enumerate(layout.groups):
+            groups_by_dtype[group.dtype_name].append((group_index, group))
 
-        for group in layout.groups:
-            group_payload = device_payloads[group.dtype_name][
-                :, group.payload_start : group.payload_end
-            ]
-            if group.dtype_name in ("float32", "bfloat16"):
+        restored_groups = [None] * len(layout.groups)
+        for dtype_name, dtype_groups in groups_by_dtype.items():
+            dtype_payload = device_payloads[dtype_name]
+            if dtype_name in ("float32", "bfloat16"):
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/dequant/float_restore"):
-                        X[:, :, group.feature_start : group.feature_end] = (
-                            group_payload.reshape(
-                                num_pages,
-                                self.page_size,
-                                group.feature_end - group.feature_start,
-                            )
-                        )
+                        dtype_values = dtype_payload.to(torch.float32)
                 else:
-                    X[:, :, group.feature_start : group.feature_end] = (
-                        group_payload.reshape(
-                            num_pages,
-                            self.page_size,
-                            group.feature_end - group.feature_start,
-                        )
-                    )
+                    dtype_values = dtype_payload.to(torch.float32)
+
+                for group_index, group in dtype_groups:
+                    group_size = group.feature_end - group.feature_start
+                    group_values = dtype_values[
+                        :, group.payload_start : group.payload_end
+                    ].view(num_pages, self.page_size, group_size)
+                    restored_groups[group_index] = group_values
                 continue
 
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/group_payload_pack"):
-                    payload = group_payload.reshape(1, -1)
+                    payload = dtype_payload.view(1, -1)
             else:
-                payload = group_payload.reshape(1, -1)
+                payload = dtype_payload.view(1, -1)
 
-            # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
-            # views with nonzero storage offsets. Materialize only affected groups.
-            if group.dtype_name == "int4" and payload.storage_offset() != 0:
-                if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/dequant/int4_materialize"):
-                        payload = payload.clone()
-                else:
-                    payload = payload.clone()
-
-            group_size = group.feature_end - group.feature_start
+            # The payload is page-major/group-major, so metadata must be put in
+            # the same order before repeating each token's scale and offset for
+            # the features in that group.  This is one expansion per dtype,
+            # independent of the number of groups sharing that dtype.
+            metadata_indices, repeat_counts = self._get_dequant_metadata_plan(
+                layout,
+                dtype_name,
+                dtype_groups,
+                num_pages,
+                device,
+            )
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/expand_metadata"):
-                    expanded_scales = device_scales[
-                        :, :, group.metadata_index
-                    ].reshape(-1).repeat_interleave(group_size)
-                    expanded_offsets = device_offsets[
-                        :, :, group.metadata_index
-                    ].reshape(-1).repeat_interleave(group_size)
+                    dtype_scales = device_scales.index_select(2, metadata_indices)
+                    dtype_offsets = device_offsets.index_select(2, metadata_indices)
+                    dtype_scales = dtype_scales.permute(0, 2, 1).reshape(-1)
+                    dtype_offsets = dtype_offsets.permute(0, 2, 1).reshape(-1)
+                    expanded_scales = torch.repeat_interleave(
+                        dtype_scales, repeat_counts
+                    )
+                    expanded_offsets = torch.repeat_interleave(
+                        dtype_offsets, repeat_counts
+                    )
             else:
-                expanded_scales = device_scales[
-                    :, :, group.metadata_index
-                ].reshape(-1).repeat_interleave(group_size)
-                expanded_offsets = device_offsets[
-                    :, :, group.metadata_index
-                ].reshape(-1).repeat_interleave(group_size)
+                dtype_scales = device_scales.index_select(2, metadata_indices)
+                dtype_offsets = device_offsets.index_select(2, metadata_indices)
+                dtype_scales = dtype_scales.permute(0, 2, 1).reshape(-1)
+                dtype_offsets = dtype_offsets.permute(0, 2, 1).reshape(-1)
+                expanded_scales = torch.repeat_interleave(
+                    dtype_scales, repeat_counts
+                )
+                expanded_offsets = torch.repeat_interleave(
+                    dtype_offsets, repeat_counts
+                )
+
             kwargs = {
                 "offset": expanded_offsets,
                 "dst_dtype": self.dtype,
             }
-            if group.dtype_name == "int4" and hasattr(torch, "int4"):
+            if dtype_name == "int4" and hasattr(torch, "int4"):
                 kwargs["src_dtype"] = torch.quint4x2
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/anti_quant"):
@@ -4006,25 +4039,24 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     expanded_scales,
                     **kwargs,
                 )
-            if self._profile_kvtc:
-                with torch.profiler.record_function("kvtc/dequant/projection_write"):
-                    X[:, :, group.feature_start : group.feature_end] = (
-                        dequantized.reshape(
-                            num_pages,
-                            self.page_size,
-                            group.feature_end - group.feature_start,
-                        )
-                    )
-            else:
-                X[:, :, group.feature_start : group.feature_end] = (
-                    dequantized.reshape(
-                        num_pages,
-                        self.page_size,
-                        group.feature_end - group.feature_start,
-                    )
-                )
 
-        return X
+            # Convert the complete dtype result once.  The slices below are
+            # views into this page/group-major result and do not write one
+            # projection slice per group.
+            dtype_values = dequantized.to(torch.float32).view(num_pages, -1)
+            output_offset = 0
+            for group_index, group in dtype_groups:
+                group_size = group.feature_end - group.feature_start
+                output_size = self.page_size * group_size
+                restored_groups[group_index] = dtype_values[
+                    :, output_offset : output_offset + output_size
+                ].view(num_pages, self.page_size, group_size)
+                output_offset += output_size
+
+        if self._profile_kvtc:
+            with torch.profiler.record_function("kvtc/dequant/projection_write"):
+                return torch.cat(restored_groups, dim=2)
+        return torch.cat(restored_groups, dim=2)
 
     def _log_quant_page_diagnostics(
         self,
