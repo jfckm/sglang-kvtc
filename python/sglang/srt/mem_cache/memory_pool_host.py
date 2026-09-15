@@ -3750,7 +3750,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         scales: torch.Tensor,
         offsets: torch.Tensor,
     ) -> None:
-        """Quantize [pages, tokens, features], preserving the per-page wire layout.
+        """Quantize [pages, tokens, features], preserving the per-page storage layout.
 
         host_pages contains CPU int64 destination page IDs in X's page order.
         Quantization reduces only the feature dimension, so every token/group
@@ -3863,51 +3863,104 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         scales: torch.Tensor,
         offsets: torch.Tensor,
     ) -> torch.Tensor:
+        return self._dequantize_pages(
+            torch.as_tensor(host_page, device="cpu", dtype=torch.int64).reshape(1),
+            layout,
+            payload_buffers,
+            scales,
+            offsets,
+        )[0]
+
+    def _dequantize_pages(
+        self,
+        host_pages: torch.Tensor,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore a batch of host pages in the order given by host_pages."""
+        num_pages = host_pages.numel()
         device = self.device_pool.device
+        if num_pages == 0:
+            return torch.empty(
+                (0, self.page_size, layout.feature_count),
+                dtype=torch.float32,
+                device=device,
+            )
+        if self._profile_kvtc:
+            with torch.profiler.record_function("kvtc/dequant/host_gather"):
+                host_payloads = {
+                    dtype_name: payload.index_select(0, host_pages)
+                    for dtype_name, payload in payload_buffers.items()
+                }
+                host_scales = scales.index_select(0, host_pages)
+                host_offsets = offsets.index_select(0, host_pages)
+        else:
+            host_payloads = {
+                dtype_name: payload.index_select(0, host_pages)
+                for dtype_name, payload in payload_buffers.items()
+            }
+            host_scales = scales.index_select(0, host_pages)
+            host_offsets = offsets.index_select(0, host_pages)
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/dequant/payload_metadata_h2d"):
                 device_payloads = {
-                    dtype_name: payload[host_page].to(device=device)
-                    for dtype_name, payload in payload_buffers.items()
+                    dtype_name: payload.to(device=device)
+                    for dtype_name, payload in host_payloads.items()
                 }
-                device_scales = scales[host_page].to(device=device, dtype=torch.float32)
-                device_offsets = offsets[host_page].to(device=device, dtype=torch.float32)
+                device_scales = host_scales.to(device=device, dtype=torch.float32)
+                device_offsets = host_offsets.to(device=device, dtype=torch.float32)
         else:
             device_payloads = {
-                dtype_name: payload[host_page].to(device=device)
-                for dtype_name, payload in payload_buffers.items()
+                dtype_name: payload.to(device=device)
+                for dtype_name, payload in host_payloads.items()
             }
-            device_scales = scales[host_page].to(device=device, dtype=torch.float32)
-            device_offsets = offsets[host_page].to(device=device, dtype=torch.float32)
+            device_scales = host_scales.to(device=device, dtype=torch.float32)
+            device_offsets = host_offsets.to(device=device, dtype=torch.float32)
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/dequant/allocate_projection"):
                 X = torch.empty(
-                    (self.page_size, layout.feature_count),
+                    (num_pages, self.page_size, layout.feature_count),
                     dtype=torch.float32,
                     device=device,
                 )
         else:
             X = torch.empty(
-                (self.page_size, layout.feature_count),
+                (num_pages, self.page_size, layout.feature_count),
                 dtype=torch.float32,
                 device=device,
             )
 
         for group in layout.groups:
-            payload = device_payloads[group.dtype_name][
-                group.payload_start : group.payload_end
-            ].reshape(1, -1)
+            group_payload = device_payloads[group.dtype_name][
+                :, group.payload_start : group.payload_end
+            ]
             if group.dtype_name in ("float32", "bfloat16"):
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/dequant/float_restore"):
-                        X[:, group.feature_start : group.feature_end] = payload.reshape(
-                            self.page_size, group.feature_end - group.feature_start
+                        X[:, :, group.feature_start : group.feature_end] = (
+                            group_payload.reshape(
+                                num_pages,
+                                self.page_size,
+                                group.feature_end - group.feature_start,
+                            )
                         )
                 else:
-                    X[:, group.feature_start : group.feature_end] = payload.reshape(
-                        self.page_size, group.feature_end - group.feature_start
+                    X[:, :, group.feature_start : group.feature_end] = (
+                        group_payload.reshape(
+                            num_pages,
+                            self.page_size,
+                            group.feature_end - group.feature_start,
+                        )
                     )
                 continue
+
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/dequant/group_payload_pack"):
+                    payload = group_payload.reshape(1, -1)
+            else:
+                payload = group_payload.reshape(1, -1)
 
             # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
             # views with nonzero storage offsets. Materialize only affected groups.
@@ -3921,19 +3974,19 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             group_size = group.feature_end - group.feature_start
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/expand_metadata"):
-                    expanded_scales = device_scales[:, group.metadata_index].repeat_interleave(
-                        group_size
-                    )
-                    expanded_offsets = device_offsets[:, group.metadata_index].repeat_interleave(
-                        group_size
-                    )
+                    expanded_scales = device_scales[
+                        :, :, group.metadata_index
+                    ].reshape(-1).repeat_interleave(group_size)
+                    expanded_offsets = device_offsets[
+                        :, :, group.metadata_index
+                    ].reshape(-1).repeat_interleave(group_size)
             else:
-                expanded_scales = device_scales[:, group.metadata_index].repeat_interleave(
-                    group_size
-                )
-                expanded_offsets = device_offsets[:, group.metadata_index].repeat_interleave(
-                    group_size
-                )
+                expanded_scales = device_scales[
+                    :, :, group.metadata_index
+                ].reshape(-1).repeat_interleave(group_size)
+                expanded_offsets = device_offsets[
+                    :, :, group.metadata_index
+                ].reshape(-1).repeat_interleave(group_size)
             kwargs = {
                 "offset": expanded_offsets,
                 "dst_dtype": self.dtype,
@@ -3955,12 +4008,20 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/projection_write"):
-                    X[:, group.feature_start : group.feature_end] = dequantized.reshape(
-                        self.page_size, group.feature_end - group.feature_start
+                    X[:, :, group.feature_start : group.feature_end] = (
+                        dequantized.reshape(
+                            num_pages,
+                            self.page_size,
+                            group.feature_end - group.feature_start,
+                        )
                     )
             else:
-                X[:, group.feature_start : group.feature_end] = dequantized.reshape(
-                    self.page_size, group.feature_end - group.feature_start
+                X[:, :, group.feature_start : group.feature_end] = (
+                    dequantized.reshape(
+                        num_pages,
+                        self.page_size,
+                        group.feature_end - group.feature_start,
+                    )
                 )
 
         return X
@@ -4085,154 +4146,206 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self._log_quant_activity("load", num_pages)
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/positions"):
-                token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
+                token_indices = torch.Tensor(token_indices).to(
+                    device_pool.device, dtype=torch.int64
+                )
         else:
             token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
-        for page in range(num_pages):
-            host_page = host_indices[page * self.page_size] // self.page_size
-            device_page = device_indices[page * self.page_size] // self.page_size
-            page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
+        for batch_start in range(0, num_pages, self._QUANT_BATCH_MAX_PAGES):
+            batch_end = min(batch_start + self._QUANT_BATCH_MAX_PAGES, num_pages)
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/dequant/host_indices"):
+                    host_pages = (
+                        host_indices[
+                            batch_start * self.page_size : batch_end
+                            * self.page_size : self.page_size
+                        ]
+                        // self.page_size
+                    ).to(device="cpu", dtype=torch.int64)
+            else:
+                host_pages = (
+                    host_indices[
+                        batch_start * self.page_size : batch_end
+                        * self.page_size : self.page_size
+                    ]
+                    // self.page_size
+                ).to(device="cpu", dtype=torch.int64)
 
-            if self.k_kvtc:
-                if self.kvtc_quant_disable:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/K/pca_h2d"):
-                            D_k = self.k_buffer[host_page].to(device=self.device_pool.device)
-                    else:
-                        D_k = self.k_buffer[host_page].to(device=self.device_pool.device)
-                else:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/K/dequantize"):
-                            D_k = self._dequantize_page(
-                                host_page,
-                                self.k_quant_layout,
-                                self.k_quant_buffers,
-                                self.k_quant_scales,
-                                self.k_quant_offsets,
-                            )
-                    else:
-                        D_k = self._dequantize_page(
-                            host_page,
+            D_k_pages = None
+            if self.k_kvtc and not self.kvtc_quant_disable:
+                if self._profile_kvtc:
+                    with torch.profiler.record_function("kvtc/K/dequantize"):
+                        D_k_pages = self._dequantize_pages(
+                            host_pages,
                             self.k_quant_layout,
                             self.k_quant_buffers,
                             self.k_quant_scales,
                             self.k_quant_offsets,
                         )
+                else:
+                    D_k_pages = self._dequantize_pages(
+                        host_pages,
+                        self.k_quant_layout,
+                        self.k_quant_buffers,
+                        self.k_quant_scales,
+                        self.k_quant_offsets,
+                    )
+
+            D_v_pages = None
+            if self.v_kvtc and not self.kvtc_quant_disable:
                 if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/K/pca_reconstruct"):
-                        X_k = (
-                            torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
-                            + self.kvtc_k_mu
+                    with torch.profiler.record_function("kvtc/V/dequantize"):
+                        D_v_pages = self._dequantize_pages(
+                            host_pages,
+                            self.v_quant_layout,
+                            self.v_quant_buffers,
+                            self.v_quant_scales,
+                            self.v_quant_offsets,
                         )
                 else:
+                    D_v_pages = self._dequantize_pages(
+                        host_pages,
+                        self.v_quant_layout,
+                        self.v_quant_buffers,
+                        self.v_quant_scales,
+                        self.v_quant_offsets,
+                    )
+
+            for page in range(batch_start, batch_end):
+                batch_page = page - batch_start
+                host_page = host_pages[batch_page]
+                device_page = device_indices[page * self.page_size] // self.page_size
+                page_token_indices = token_indices[
+                    page * self.page_size : page * self.page_size + self.page_size
+                ]
+                self._load_page_to_device(
+                    device_pool,
+                    host_page,
+                    device_page,
+                    page_token_indices,
+                    D_k_pages[batch_page] if D_k_pages is not None else None,
+                    D_v_pages[batch_page] if D_v_pages is not None else None,
+                )
+
+    def _load_page_to_device(
+        self,
+        device_pool,
+        host_page: int,
+        device_page: int,
+        page_token_indices: torch.Tensor,
+        D_k: Optional[torch.Tensor],
+        D_v: Optional[torch.Tensor],
+    ) -> None:
+        if self.k_kvtc:
+            if self.kvtc_quant_disable:
+                if self._profile_kvtc:
+                    with torch.profiler.record_function("kvtc/K/pca_h2d"):
+                        D_k = self.k_buffer[host_page].to(
+                            device=self.device_pool.device
+                        )
+                else:
+                    D_k = self.k_buffer[host_page].to(device=self.device_pool.device)
+            assert D_k is not None
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/K/pca_reconstruct"):
                     X_k = (
-                        torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
+                        torch.matmul(
+                            D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T
+                        )
                         + self.kvtc_k_mu
                     )
-                if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/K/rope_and_device_write"):
-                        device_pool.k_buffer[:, device_page, ...] = (
-                            self.rotary_emb.forward_native_keys_batch(
-                                page_token_indices,
-                                X_k.reshape(
-                                    self.device_page_shape[1],
-                                    self.device_page_shape[0],
-                                    *self.device_page_shape[2:]
-                                ),
-                            ).transpose(1, 0)
-                        )
-                else:
+            else:
+                X_k = (
+                    torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
+                    + self.kvtc_k_mu
+                )
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/K/rope_and_device_write"):
                     device_pool.k_buffer[:, device_page, ...] = (
                         self.rotary_emb.forward_native_keys_batch(
                             page_token_indices,
                             X_k.reshape(
                                 self.device_page_shape[1],
                                 self.device_page_shape[0],
-                                *self.device_page_shape[2:]
+                                *self.device_page_shape[2:],
                             ),
                         ).transpose(1, 0)
                     )
             else:
+                device_pool.k_buffer[:, device_page, ...] = (
+                    self.rotary_emb.forward_native_keys_batch(
+                        page_token_indices,
+                        X_k.reshape(
+                            self.device_page_shape[1],
+                            self.device_page_shape[0],
+                            *self.device_page_shape[2:],
+                        ),
+                    ).transpose(1, 0)
+                )
+        else:
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/K/raw_h2d"):
+                    device_pool.k_buffer[:, device_page, ...] = self.k_buffer[
+                        :, host_page, ...
+                    ].to(device=self.device_pool.device)
+            else:
+                device_pool.k_buffer[:, device_page, ...] = self.k_buffer[
+                    :, host_page, ...
+                ].to(device=self.device_pool.device)
+
+        if self.v_kvtc:
+            if self.kvtc_quant_disable:
                 if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/K/raw_h2d"):
-                        device_pool.k_buffer[:, device_page, ...] = self.k_buffer[:, host_page, ...].to(
+                    with torch.profiler.record_function("kvtc/V/pca_h2d"):
+                        D_v = self.v_buffer[host_page].to(
                             device=self.device_pool.device
                         )
                 else:
-                    device_pool.k_buffer[:, device_page, ...] = self.k_buffer[:, host_page, ...].to(
-                        device=self.device_pool.device
-                    )
-
-            if self.v_kvtc:
-                if self.kvtc_quant_disable:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/V/pca_h2d"):
-                            D_v = self.v_buffer[host_page].to(device=self.device_pool.device)
-                    else:
-                        D_v = self.v_buffer[host_page].to(device=self.device_pool.device)
-                else:
-                    if self._profile_kvtc:
-                        with torch.profiler.record_function("kvtc/V/dequantize"):
-                            D_v = self._dequantize_page(
-                                host_page,
-                                self.v_quant_layout,
-                                self.v_quant_buffers,
-                                self.v_quant_scales,
-                                self.v_quant_offsets,
-                            )
-                    else:
-                        D_v = self._dequantize_page(
-                            host_page,
-                            self.v_quant_layout,
-                            self.v_quant_buffers,
-                            self.v_quant_scales,
-                            self.v_quant_offsets,
-                        )
-                if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/V/pca_reconstruct"):
-                        X_v = (
-                            (
-                                torch.matmul(
-                                    D_v.to(dtype=self.kvtc_v_V.dtype),
-                                    self.kvtc_v_V.T,
-                                )
-                                + self.kvtc_v_mu
-                            )
-                            .reshape(self.page_size, self.layer_num, -1)
-                            .transpose(1, 0)
-                        )
-                else:
+                    D_v = self.v_buffer[host_page].to(device=self.device_pool.device)
+            assert D_v is not None
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/V/pca_reconstruct"):
                     X_v = (
                         (
                             torch.matmul(
-                                D_v.to(dtype=self.kvtc_v_V.dtype),
-                                self.kvtc_v_V.T,
+                                D_v.to(dtype=self.kvtc_v_V.dtype), self.kvtc_v_V.T
                             )
                             + self.kvtc_v_mu
                         )
                         .reshape(self.page_size, self.layer_num, -1)
                         .transpose(1, 0)
                     )
-                if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/V/device_write"):
-                        device_pool.v_buffer[:, device_page, ...] = X_v.reshape(*self.device_page_shape).to(
-                            dtype=self.dtype
-                        )
-                else:
-                    device_pool.v_buffer[:, device_page, ...] = X_v.reshape(*self.device_page_shape).to(
-                        dtype=self.dtype
-                    )
             else:
-                if self._profile_kvtc:
-                    with torch.profiler.record_function("kvtc/V/raw_h2d"):
-                        device_pool.v_buffer[:, device_page, ...] = self.v_buffer[:, host_page, ...].to(
-                            device=self.device_pool.device
+                X_v = (
+                    (
+                        torch.matmul(
+                            D_v.to(dtype=self.kvtc_v_V.dtype), self.kvtc_v_V.T
                         )
-                else:
-                    device_pool.v_buffer[:, device_page, ...] = self.v_buffer[:, host_page, ...].to(
-                        device=self.device_pool.device
+                        + self.kvtc_v_mu
                     )
+                    .reshape(self.page_size, self.layer_num, -1)
+                    .transpose(1, 0)
+                )
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/V/device_write"):
+                    device_pool.v_buffer[:, device_page, ...] = X_v.reshape(
+                        *self.device_page_shape
+                    ).to(dtype=self.dtype)
+            else:
+                device_pool.v_buffer[:, device_page, ...] = X_v.reshape(
+                    *self.device_page_shape
+                ).to(dtype=self.dtype)
+        else:
+            if self._profile_kvtc:
+                with torch.profiler.record_function("kvtc/V/raw_h2d"):
+                    device_pool.v_buffer[:, device_page, ...] = self.v_buffer[
+                        :, host_page, ...
+                    ].to(device=self.device_pool.device)
+            else:
+                device_pool.v_buffer[:, device_page, ...] = self.v_buffer[
+                    :, host_page, ...
+                ].to(device=self.device_pool.device)
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, token_indices, token_io_backend
