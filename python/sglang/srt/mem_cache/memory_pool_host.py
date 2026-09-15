@@ -3731,9 +3731,11 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         quantized_by_dtype = defaultdict(list)
         group_scales = []
         group_offsets = []
+        X_cast = X.to(self.dtype)
+
         for group in layout.groups:
-            group_values = X[:, group.feature_start : group.feature_end]
             if group.dtype_name in ("float32", "bfloat16"):
+                group_values = X[:, group.feature_start : group.feature_end]
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/quant/float_payload"):
                         quantized_by_dtype[group.dtype_name].append(
@@ -3749,9 +3751,9 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     )
                 continue
 
+            group_values = X_cast[:, group.feature_start : group.feature_end]
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/quant/quantize"):
-                    group_values = group_values.to(dtype=self.dtype)
                     dst_type = (
                         torch.quint4x2 if group.dtype_name == "int4" else torch.int8
                     )
@@ -3759,7 +3761,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                         group_values, dst_type=dst_type
                     )
             else:
-                group_values = group_values.to(dtype=self.dtype)
                 dst_type = (
                     torch.quint4x2 if group.dtype_name == "int4" else torch.int8
                 )
