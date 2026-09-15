@@ -3909,15 +3909,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     dtype_name: payload.to(device=device)
                     for dtype_name, payload in host_payloads.items()
                 }
-                device_scales = host_scales.to(device=device, dtype=torch.float32)
-                device_offsets = host_offsets.to(device=device, dtype=torch.float32)
+                device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
+                device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
         else:
             device_payloads = {
                 dtype_name: payload.to(device=device)
                 for dtype_name, payload in host_payloads.items()
             }
-            device_scales = host_scales.to(device=device, dtype=torch.float32)
-            device_offsets = host_offsets.to(device=device, dtype=torch.float32)
+            device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
+            device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/dequant/allocate_projection"):
                 X = torch.empty(
