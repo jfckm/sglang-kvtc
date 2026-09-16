@@ -3932,7 +3932,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 device=device,
             )
 
-        for group in layout.groups:
+        quantized_group_indices = defaultdict(list)
+        for group_index, group in enumerate(layout.groups):
             group_payload = device_payloads[group.dtype_name][
                 :, group.payload_start : group.payload_end
             ]
@@ -3956,42 +3957,76 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     )
                 continue
 
+            quantized_group_indices[group.dtype_name].append(group_index)
+
+        for dtype_name, group_indices in quantized_group_indices.items():
+            groups = [layout.groups[group_index] for group_index in group_indices]
+
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/group_payload_pack"):
-                    payload = group_payload.reshape(1, -1)
+                    payload = torch.cat(
+                        [
+                            device_payloads[dtype_name][
+                                :, group.payload_start : group.payload_end
+                            ].reshape(num_pages, self.page_size, -1)
+                            for group in groups
+                        ],
+                        dim=2,
+                    ).reshape(1, -1)
             else:
-                payload = group_payload.reshape(1, -1)
+                payload = torch.cat(
+                    [
+                        device_payloads[dtype_name][
+                            :, group.payload_start : group.payload_end
+                        ].reshape(num_pages, self.page_size, -1)
+                        for group in groups
+                    ],
+                    dim=2,
+                ).reshape(1, -1)
 
             # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
-            # views with nonzero storage offsets. Materialize only affected groups.
-            if group.dtype_name == "int4" and payload.storage_offset() != 0:
+            # views with nonzero storage offsets. Keep this guard after packing so
+            # the exact tensor passed to npu_anti_quant is materialized if needed.
+            if dtype_name == "int4" and payload.storage_offset() != 0:
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/dequant/int4_materialize"):
                         payload = payload.clone()
                 else:
                     payload = payload.clone()
 
-            group_size = group.feature_end - group.feature_start
+            feature_indices = []
+            metadata_indices = []
+            for group in groups:
+                group_size = group.feature_end - group.feature_start
+                feature_indices.extend(range(group.feature_start, group.feature_end))
+                metadata_indices.extend([group.metadata_index] * group_size)
+            feature_indices = torch.tensor(
+                feature_indices, dtype=torch.long, device=device
+            )
+            metadata_indices = torch.tensor(
+                metadata_indices, dtype=torch.long, device=device
+            )
+
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/expand_metadata"):
-                    expanded_scales = device_scales[
-                        :, :, group.metadata_index
-                    ].reshape(-1).repeat_interleave(group_size)
-                    expanded_offsets = device_offsets[
-                        :, :, group.metadata_index
-                    ].reshape(-1).repeat_interleave(group_size)
+                    expanded_scales = device_scales.index_select(
+                        2, metadata_indices
+                    ).reshape(-1)
+                    expanded_offsets = device_offsets.index_select(
+                        2, metadata_indices
+                    ).reshape(-1)
             else:
-                expanded_scales = device_scales[
-                    :, :, group.metadata_index
-                ].reshape(-1).repeat_interleave(group_size)
-                expanded_offsets = device_offsets[
-                    :, :, group.metadata_index
-                ].reshape(-1).repeat_interleave(group_size)
+                expanded_scales = device_scales.index_select(
+                    2, metadata_indices
+                ).reshape(-1)
+                expanded_offsets = device_offsets.index_select(
+                    2, metadata_indices
+                ).reshape(-1)
             kwargs = {
                 "offset": expanded_offsets,
                 "dst_dtype": self.dtype,
             }
-            if group.dtype_name == "int4" and hasattr(torch, "int4"):
+            if dtype_name == "int4" and hasattr(torch, "int4"):
                 kwargs["src_dtype"] = torch.quint4x2
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/anti_quant"):
@@ -4008,20 +4043,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/projection_write"):
-                    X[:, :, group.feature_start : group.feature_end] = (
-                        dequantized.reshape(
-                            num_pages,
-                            self.page_size,
-                            group.feature_end - group.feature_start,
-                        )
-                    )
-            else:
-                X[:, :, group.feature_start : group.feature_end] = (
-                    dequantized.reshape(
+                    X[:, :, feature_indices] = dequantized.reshape(
                         num_pages,
                         self.page_size,
-                        group.feature_end - group.feature_start,
+                        feature_indices.numel(),
                     )
+            else:
+                X[:, :, feature_indices] = dequantized.reshape(
+                    num_pages,
+                    self.page_size,
+                    feature_indices.numel(),
                 )
 
         return X
