@@ -3355,6 +3355,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.v_kvtc = False
         self.k_quant_layout = None
         self.v_quant_layout = None
+        self._dequant_indices_by_layout = {}
 
         if getattr(self, "kvtc_quant_debug", False):
             logger.info(
@@ -3459,6 +3460,13 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
                 )
 
+            if not self.kvtc_quant_disable:
+                for layout in (self.k_quant_layout, self.v_quant_layout):
+                    if layout is not None:
+                        self._dequant_indices_by_layout[id(layout)] = (
+                            self._build_dequant_indices(layout)
+                        )
+
             torch_npu.npu.synchronize()
 
         self.page_size_bytes = self._get_page_size_bytes()
@@ -3556,6 +3564,43 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             )
 
         return layout
+
+    def _build_dequant_indices(
+        self, layout: _KVTCQuantLayout
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        groups_by_dtype = defaultdict(list)
+        for group in layout.groups:
+            if group.metadata_index is not None:
+                groups_by_dtype[group.dtype_name].append(group)
+
+        device = self.device_pool.device
+        indices_by_dtype = {}
+        for dtype_name, groups in groups_by_dtype.items():
+            payload_indices = []
+            for token_index in range(self.page_size):
+                for group in groups:
+                    packed_width = (
+                        group.payload_end - group.payload_start
+                    ) // self.page_size
+                    token_start = group.payload_start + token_index * packed_width
+                    payload_indices.extend(
+                        range(token_start, token_start + packed_width)
+                    )
+
+            feature_indices = []
+            metadata_indices = []
+            for group in groups:
+                group_size = group.feature_end - group.feature_start
+                feature_indices.extend(range(group.feature_start, group.feature_end))
+                metadata_indices.extend([group.metadata_index] * group_size)
+
+            indices_by_dtype[dtype_name] = (
+                torch.tensor(payload_indices, dtype=torch.long, device=device),
+                torch.tensor(metadata_indices, dtype=torch.long, device=device),
+                torch.tensor(feature_indices, dtype=torch.long, device=device),
+            )
+
+        return indices_by_dtype
 
     def _get_matrix_page_size_bytes(
         self,
@@ -3932,12 +3977,11 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 device=device,
             )
 
-        quantized_group_indices = defaultdict(list)
-        for group_index, group in enumerate(layout.groups):
-            group_payload = device_payloads[group.dtype_name][
-                :, group.payload_start : group.payload_end
-            ]
+        for group in layout.groups:
             if group.dtype_name in ("float32", "bfloat16"):
+                group_payload = device_payloads[group.dtype_name][
+                    :, group.payload_start : group.payload_end
+                ]
                 if self._profile_kvtc:
                     with torch.profiler.record_function("kvtc/dequant/float_restore"):
                         X[:, :, group.feature_start : group.feature_end] = (
@@ -3955,33 +3999,21 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                             group.feature_end - group.feature_start,
                         )
                     )
-                continue
 
-            quantized_group_indices[group.dtype_name].append(group_index)
-
-        for dtype_name, group_indices in quantized_group_indices.items():
-            groups = [layout.groups[group_index] for group_index in group_indices]
+        indices_by_dtype = self._dequant_indices_by_layout[id(layout)]
+        for (
+            dtype_name,
+            (payload_indices, metadata_indices, feature_indices),
+        ) in indices_by_dtype.items():
 
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/group_payload_pack"):
-                    payload = torch.cat(
-                        [
-                            device_payloads[dtype_name][
-                                :, group.payload_start : group.payload_end
-                            ].reshape(num_pages, self.page_size, -1)
-                            for group in groups
-                        ],
-                        dim=2,
+                    payload = device_payloads[dtype_name].index_select(
+                        1, payload_indices
                     ).reshape(1, -1)
             else:
-                payload = torch.cat(
-                    [
-                        device_payloads[dtype_name][
-                            :, group.payload_start : group.payload_end
-                        ].reshape(num_pages, self.page_size, -1)
-                        for group in groups
-                    ],
-                    dim=2,
+                payload = device_payloads[dtype_name].index_select(
+                    1, payload_indices
                 ).reshape(1, -1)
 
             # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
@@ -3993,19 +4025,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                         payload = payload.clone()
                 else:
                     payload = payload.clone()
-
-            feature_indices = []
-            metadata_indices = []
-            for group in groups:
-                group_size = group.feature_end - group.feature_start
-                feature_indices.extend(range(group.feature_start, group.feature_end))
-                metadata_indices.extend([group.metadata_index] * group_size)
-            feature_indices = torch.tensor(
-                feature_indices, dtype=torch.long, device=device
-            )
-            metadata_indices = torch.tensor(
-                metadata_indices, dtype=torch.long, device=device
-            )
 
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/expand_metadata"):
