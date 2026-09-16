@@ -3356,6 +3356,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.k_quant_layout = None
         self.v_quant_layout = None
         self._dequant_indices_by_layout = {}
+        self._dequant_payload_staging = {}
 
         if getattr(self, "kvtc_quant_debug", False):
             logger.info(
@@ -3689,8 +3690,61 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         offsets = torch.zeros_like(scales)
         return payload_buffers, scales, offsets
 
+    def _allocate_dequant_payload_staging(
+        self,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        staging = {
+            dtype_name: torch.empty(
+                (self._QUANT_BATCH_MAX_PAGES, element_count),
+                dtype=self._QUANT_STORAGE_DTYPES[dtype_name],
+                device=self.device_pool.device,
+            )
+            for dtype_name, element_count in layout.payload_elements.items()
+        }
+        self._dequant_payload_staging[(id(layout), id(payload_buffers))] = staging
+        return staging
+
+    def _get_dequant_payload_staging(
+        self,
+        layout: _KVTCQuantLayout,
+        payload_buffers: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        # The lazy fallback keeps reconstruction/debugging helpers that supply
+        # their own payload buffers working while normal K/V buffers are
+        # registered eagerly in init_kv_buffer().
+        staging_by_source = getattr(self, "_dequant_payload_staging", None)
+        if staging_by_source is None:
+            self._dequant_payload_staging = {}
+            staging_by_source = self._dequant_payload_staging
+        key = (id(layout), id(payload_buffers))
+        if key not in staging_by_source:
+            return self._allocate_dequant_payload_staging(layout, payload_buffers)
+        return staging_by_source[key]
+
+    @staticmethod
+    def _stage_dequant_payloads(
+        host_page_list: list[int],
+        num_pages: int,
+        payload_buffers: dict[str, torch.Tensor],
+        payload_staging: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        device_payloads = {}
+        for dtype_name, payload_buffer in payload_buffers.items():
+            staged_payload = payload_staging[dtype_name][:num_pages]
+            for dst_page, src_page in enumerate(host_page_list):
+                staged_payload[dst_page].copy_(
+                    payload_buffer[src_page], non_blocking=True
+                )
+            device_payloads[dtype_name] = staged_payload
+        return device_payloads
+
     def init_kv_buffer(self):
         logger.info(f"NPU compressed pool alloc begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
+        # Hybrid-pool initialization can rebuild the backing buffers. Drop any
+        # staging tensors associated with the previous K/V payload dictionaries.
+        self._dequant_payload_staging = {}
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -3701,6 +3755,9 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.k_quant_scales,
                 self.k_quant_offsets,
             ) = self._allocate_quant_buffers(self.k_quant_layout)
+            self._allocate_dequant_payload_staging(
+                self.k_quant_layout, self.k_quant_buffers
+            )
             self.k_buffer = self.k_quant_buffers
         elif self.k_kvtc:
             self.k_buffer = torch.zeros(
@@ -3729,6 +3786,9 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.v_quant_scales,
                 self.v_quant_offsets,
             ) = self._allocate_quant_buffers(self.v_quant_layout)
+            self._allocate_dequant_payload_staging(
+                self.v_quant_layout, self.v_quant_buffers
+            )
             self.v_buffer = self.v_quant_buffers
         elif self.v_kvtc:
             self.v_buffer = torch.zeros(
@@ -3933,34 +3993,40 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 dtype=torch.float32,
                 device=device,
             )
+        payload_staging = self._get_dequant_payload_staging(
+            layout, payload_buffers
+        )
+        staging_capacity = next(iter(payload_staging.values())).shape[0]
+        if num_pages > staging_capacity:
+            raise ValueError(
+                f"KVTC dequantization batch has {num_pages} pages, but payload "
+                f"staging is limited to {staging_capacity}"
+            )
+        host_page_list = host_pages.tolist()
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/dequant/host_gather"):
-                host_payloads = {
-                    dtype_name: payload.index_select(0, host_pages)
-                    for dtype_name, payload in payload_buffers.items()
-                }
                 host_scales = scales.index_select(0, host_pages)
                 host_offsets = offsets.index_select(0, host_pages)
         else:
-            host_payloads = {
-                dtype_name: payload.index_select(0, host_pages)
-                for dtype_name, payload in payload_buffers.items()
-            }
             host_scales = scales.index_select(0, host_pages)
             host_offsets = offsets.index_select(0, host_pages)
         if self._profile_kvtc:
             with torch.profiler.record_function("kvtc/dequant/payload_metadata_h2d"):
-                device_payloads = {
-                    dtype_name: payload.to(device=device)
-                    for dtype_name, payload in host_payloads.items()
-                }
+                device_payloads = self._stage_dequant_payloads(
+                    host_page_list,
+                    num_pages,
+                    payload_buffers,
+                    payload_staging,
+                )
                 device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
                 device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
         else:
-            device_payloads = {
-                dtype_name: payload.to(device=device)
-                for dtype_name, payload in host_payloads.items()
-            }
+            device_payloads = self._stage_dequant_payloads(
+                host_page_list,
+                num_pages,
+                payload_buffers,
+                payload_staging,
+            )
             device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
             device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
         if self._profile_kvtc:
