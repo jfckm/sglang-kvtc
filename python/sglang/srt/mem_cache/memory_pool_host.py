@@ -4043,13 +4043,13 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 )
             if self._profile_kvtc:
                 with torch.profiler.record_function("kvtc/dequant/projection_write"):
-                    X[:, :, feature_indices] = dequantized.reshape(
+                    X[:, :, feature_indices] = dequantized.to(dtype=X.dtype).reshape(
                         num_pages,
                         self.page_size,
                         feature_indices.numel(),
                     )
             else:
-                X[:, :, feature_indices] = dequantized.reshape(
+                X[:, :, feature_indices] = dequantized.to(dtype=X.dtype).reshape(
                     num_pages,
                     self.page_size,
                     feature_indices.numel(),
