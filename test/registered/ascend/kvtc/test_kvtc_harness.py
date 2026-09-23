@@ -978,8 +978,11 @@ class Test04QuantBatchOrdering(TimedTestCase):
             torch.npu.synchronize()
             FixtureFactory.reload(self.pool, request, torch)
             order = torch.tensor(reversed_pages, device="npu", dtype=torch.int64)
-            for actual, expected in zip(
-                FixtureFactory.read(self.device_pool, device_indices), reference
+            for matrix, actual, expected, source_signature in zip(
+                ("k", "v"),
+                FixtureFactory.read(self.device_pool, device_indices),
+                reference,
+                source_signatures,
             ):
                 expected = expected.reshape(
                     self.device_pool.layer_num,
@@ -988,7 +991,27 @@ class Test04QuantBatchOrdering(TimedTestCase):
                     self.device_pool.head_num,
                     self.device_pool.head_dim,
                 ).index_select(1, order).reshape_as(actual)
-                self.assertTrue(torch.equal(actual, expected))
+                self.assertTrue(bool(torch.isfinite(actual).all()))
+                restored_signature = FixtureFactory.page_basis_signatures(
+                    actual,
+                    positions,
+                    self.pool.compressed_pool,
+                    self.rotary,
+                    matrix,
+                )
+                expected_signature = source_signature.index_select(0, order)
+                minimum_gap = torch.diff(source_signature).abs().min()
+                self.assertTrue(
+                    bool(
+                        (
+                            (restored_signature - expected_signature).abs()
+                            < minimum_gap / 2
+                        ).all()
+                    )
+                )
+                # Reversing 33 pages changes which page uses the one-page batch.
+                # Its PCA matmul may round differently from the 32-page batch.
+                torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
         finally:
             torch.npu.synchronize()
             self.pool.free(allocated)
