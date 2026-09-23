@@ -566,6 +566,63 @@ class Test01HybridPool(TimedTestCase):
             torch.npu.synchronize()
             self.pool.free(torch.cat((sink, compressed)))
 
+    def test_03_quantized_groups_are_offloaded(self):
+        torch = self.torch
+        compressed_pool = self.pool.compressed_pool
+        matrices = (
+            ("K", compressed_pool.k_quant_layout, compressed_pool.k_quant_scales),
+            ("V", compressed_pool.v_quant_layout, compressed_pool.v_quant_scales),
+        )
+        # Require both integer storage types so this test covers either being skipped.
+        quantized_groups = [
+            (matrix, scales, group)
+            for matrix, layout, scales in matrices
+            for group in layout.groups
+            if group.dtype_name in ("int4", "int8")
+        ]
+        self.assertEqual(
+            {group.dtype_name for _, _, group in quantized_groups},
+            {"int4", "int8"},
+            "The harness artifact must contain both INT4 and INT8 groups",
+        )
+
+        sink, compressed = self.pool.alloc(0, self.config.page_size)
+        self.assertIsNotNone(sink)
+        self.assertIsNotNone(compressed)
+        try:
+            host_page = int(compressed[0]) // self.config.page_size
+            device_indices = torch.arange(
+                self.config.page_size, 2 * self.config.page_size, dtype=torch.int64
+            )
+            FixtureFactory.fill(self.device_pool, device_indices, torch)
+            # Mark every quantized group's host metadata before offloading.
+            for _, scales, group in quantized_groups:
+                scales[host_page, :, group.metadata_index].fill_(float("nan"))
+
+            request = FixtureFactory.request(
+                self.device_pool,
+                sink_host=sink,
+                compressed_host=compressed,
+                sink_device=device_indices[:0],
+                compressed_device=device_indices,
+                compressed_tokens=device_indices.to("npu"),
+            )
+            self.pool.backup_from_device_all_layer(request)
+            torch.npu.synchronize()
+
+            # Each group must replace its marker with finite quantization scales.
+            for matrix, scales, group in quantized_groups:
+                self.assertTrue(
+                    bool(
+                        torch.isfinite(scales[host_page, :, group.metadata_index]).all()
+                    ),
+                    f"{matrix} {group.dtype_name} group at feature "
+                    f"{group.feature_start} was not offloaded",
+                )
+        finally:
+            torch.npu.synchronize()
+            self.pool.free(compressed)
+
 
 class Test02TransferModes(TimedTestCase):
     @classmethod
