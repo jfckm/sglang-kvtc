@@ -6,6 +6,7 @@ artifact determine the local KV shape during fixture initialization.
 
 from __future__ import annotations
 
+import atexit
 import gc
 import re
 import sys
@@ -128,9 +129,12 @@ class FixtureFactory:
         if not isinstance(artifact, dict):
             raise ValueError("KVTC calibration artifact must contain a dictionary")
         worker_sets = []
-        for side, ratio in (("keys", k_cr), ("values", v_cr)):
-            if ratio <= 0:
-                continue
+        worker_sides = [
+            side for side, ratio in (("keys", k_cr), ("values", v_cr)) if ratio > 0
+        ]
+        if not worker_sides:
+            worker_sides = [side for side in ("keys", "values") if side in artifact]
+        for side in worker_sides:
             entries = artifact.get(side)
             if not isinstance(entries, dict) or worker_name not in entries:
                 raise ValueError(f"Artifact is missing {side}/{worker_name}")
@@ -142,7 +146,7 @@ class FixtureFactory:
                 raise ValueError(f"Artifact {side} has invalid worker names")
             worker_sets.append(workers)
         if not worker_sets or any(workers != worker_sets[0] for workers in worker_sets):
-            raise ValueError("Enabled K/V artifact worker sets must match")
+            raise ValueError("Artifact K/V worker sets must match")
         workers = worker_sets[0]
         ranks = {
             tuple(map(int, re.fullmatch(r"tp_(\d+)_pp_(\d+)", name).groups()))
@@ -290,21 +294,99 @@ class FixtureFactory:
         )
 
     @staticmethod
-    def request(device_pool, sink, compressed, device_indices, torch):
+    def request(
+        device_pool,
+        *,
+        sink_host,
+        compressed_host,
+        sink_device,
+        compressed_device,
+        compressed_tokens,
+    ):
         from sglang.srt.mem_cache.memory_pool_host import KVTCHostMemoryRequest
 
         return KVTCHostMemoryRequest(
             device_memory_pool=device_pool,
-            host_indices_compressed=compressed,
-            device_indices_compressed=device_indices[128:],
-            token_indices_compressed=torch.arange(
-                128, 256, device="npu", dtype=torch.int64
-            ),
-            host_indices_sink=sink,
-            device_indices_sink=device_indices[:128],
+            host_indices_compressed=compressed_host,
+            device_indices_compressed=compressed_device,
+            token_indices_compressed=compressed_tokens,
+            host_indices_sink=sink_host,
+            device_indices_sink=sink_device,
             io_backend="kernel_ascend",
             layer_id=None,
         )
+
+    @staticmethod
+    def reload(pool, request, torch):
+        for layer in range(request.device_memory_pool.layer_num):
+            request.layer_id = layer
+            pool.load_to_device_per_layer(request)
+        torch.npu.synchronize()
+
+    @staticmethod
+    def pca_reference(original, positions, entry, ratio, rotary, is_key, torch):
+        layers, tokens, heads, head_dim = original.shape
+        features = layers * heads * head_dim
+        mu = entry["mu"].to("npu")
+        basis = entry["basis"][:, : features // ratio].to("npu")
+        values = original.transpose(0, 1).contiguous()
+        if is_key:
+            values = rotary.invert_native_keys_batch(positions, values)
+        projection = (values.reshape(tokens, features) - mu) @ basis
+        projection = projection.to(original.dtype).to(basis.dtype)
+        reconstructed = (projection @ basis.T + mu).reshape(
+            tokens, layers, heads, head_dim
+        )
+        if is_key:
+            reconstructed = rotary.forward_native_keys_batch(
+                positions, reconstructed
+            )
+        return reconstructed.transpose(0, 1).to(original.dtype)
+
+    @staticmethod
+    def fill_distinct_pages(
+        device_pool, indices, positions, compressed_pool, rotary, torch
+    ):
+        page_size = compressed_pool.page_size
+        page_count = len(indices) // page_size
+        coefficients = (
+            torch.arange(page_count, device="npu", dtype=torch.float32)
+            .repeat_interleave(page_size)
+            .mul(4)
+            + torch.arange(page_size, device="npu", dtype=torch.float32)
+            .repeat(page_count)
+            .div(page_size)
+        )
+        for matrix, buffer in (
+            ("k", device_pool.k_buffer),
+            ("v", device_pool.v_buffer),
+        ):
+            mu = getattr(compressed_pool, f"kvtc_{matrix}_mu")
+            basis = getattr(compressed_pool, f"kvtc_{matrix}_V")[:, 0]
+            values = (mu[None, :] + coefficients[:, None] * basis[None, :]).reshape(
+                len(indices),
+                device_pool.layer_num,
+                device_pool.head_num,
+                device_pool.head_dim,
+            )
+            if matrix == "k":
+                values = rotary.forward_native_keys_batch(positions, values)
+            buffer.flatten(1, 2).index_copy_(
+                1, indices.to("npu"), values.transpose(0, 1).to(buffer.dtype)
+            )
+        torch.npu.synchronize()
+
+    @staticmethod
+    def page_basis_signatures(
+        values, positions, compressed_pool, rotary, matrix
+    ):
+        tokens_first = values.transpose(0, 1).contiguous()
+        if matrix == "k":
+            tokens_first = rotary.invert_native_keys_batch(positions, tokens_first)
+        mu = getattr(compressed_pool, f"kvtc_{matrix}_mu")
+        basis = getattr(compressed_pool, f"kvtc_{matrix}_V")[:, 0]
+        coefficients = (tokens_first.reshape(len(positions), -1).float() - mu) @ basis
+        return coefficients.reshape(-1, compressed_pool.page_size).mean(dim=1)
 
     @staticmethod
     def tree(config: HarnessConfig, device_pool, rotary, torch):
@@ -461,7 +543,12 @@ class Test01HybridPool(TimedTestCase):
         )
         original = FixtureFactory.fill(self.device_pool, indices, torch)
         request = FixtureFactory.request(
-            self.device_pool, sink, compressed, indices, torch
+            self.device_pool,
+            sink_host=sink,
+            compressed_host=compressed,
+            sink_device=indices[:128],
+            compressed_device=indices[128:],
+            compressed_tokens=torch.arange(128, 256, device="npu", dtype=torch.int64),
         )
         try:
             self.pool.backup_from_device_all_layer(request)
@@ -469,10 +556,7 @@ class Test01HybridPool(TimedTestCase):
             for buffer in (self.device_pool.k_buffer, self.device_pool.v_buffer):
                 buffer.flatten(1, 2).index_fill_(1, indices.to("npu"), float("nan"))
             torch.npu.synchronize()
-            for layer in range(self.device_pool.layer_num):
-                request.layer_id = layer
-                self.pool.load_to_device_per_layer(request)
-            torch.npu.synchronize()
+            FixtureFactory.reload(self.pool, request, torch)
             for actual, expected in zip(
                 FixtureFactory.read(self.device_pool, indices), original
             ):
@@ -483,7 +567,116 @@ class Test01HybridPool(TimedTestCase):
             self.pool.free(torch.cat((sink, compressed)))
 
 
-class Test02HiRadixCacheWorkflow(TimedTestCase):
+class Test02TransferModes(TimedTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = DEFAULT_CONFIG
+        cls.torch, cls.rotary, cls.worker, shape = FixtureFactory.prepare(cls.config)
+        cls.device_pool = FixtureFactory.device_pool(cls.config, shape, cls.torch)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.torch.npu.synchronize()
+        del cls.device_pool
+        gc.collect()
+        cls.torch.npu.empty_cache()
+
+    def test_01_k_only_v_only_pca_only_and_baseline(self):
+        torch = self.torch
+        page_size = self.config.page_size
+        indices = torch.arange(page_size, 3 * page_size, dtype=torch.int64)
+        positions = torch.arange(
+            page_size, 2 * page_size, device="npu", dtype=torch.int64
+        )
+        artifact = torch.load(
+            self.config.artifact_path, map_location="cpu", weights_only=True
+        )
+        modes = (
+            ("K only", replace(self.config, v_cr=0), True, False),
+            ("V only", replace(self.config, k_cr=0), False, True),
+            ("PCA only", replace(self.config, quant_disable=True), True, True),
+            ("baseline", replace(self.config, k_cr=0, v_cr=0), False, False),
+        )
+        for name, config, compress_k, compress_v in modes:
+            with self.subTest(mode=name):
+                FixtureFactory.prepare(config)
+                pool = FixtureFactory.hybrid_pool(
+                    config, self.device_pool, self.rotary, self.worker
+                )
+                sink = compressed = None
+                try:
+                    self.assertEqual(pool.compressed_pool.k_kvtc, compress_k)
+                    self.assertEqual(pool.compressed_pool.v_kvtc, compress_v)
+                    self.assertEqual(
+                        pool.compressed_pool.kvtc_quant_disable,
+                        config.quant_disable,
+                    )
+                    sink, compressed = pool.alloc(page_size, page_size)
+                    self.assertIsNotNone(sink)
+                    self.assertIsNotNone(compressed)
+                    original = FixtureFactory.fill(self.device_pool, indices, torch)
+                    request = FixtureFactory.request(
+                        self.device_pool,
+                        sink_host=sink,
+                        compressed_host=compressed,
+                        sink_device=indices[:page_size],
+                        compressed_device=indices[page_size:],
+                        compressed_tokens=positions,
+                    )
+                    pool.backup_from_device_all_layer(request)
+                    torch.npu.synchronize()
+                    for buffer in (
+                        self.device_pool.k_buffer,
+                        self.device_pool.v_buffer,
+                    ):
+                        buffer.flatten(1, 2).index_fill_(
+                            1, indices.to("npu"), float("nan")
+                        )
+                    torch.npu.synchronize()
+                    FixtureFactory.reload(pool, request, torch)
+                    for is_key, compressed_side, expected, actual in zip(
+                        (True, False),
+                        (compress_k, compress_v),
+                        original,
+                        FixtureFactory.read(self.device_pool, indices),
+                    ):
+                        self.assertTrue(
+                            torch.equal(actual[:, :page_size], expected[:, :page_size])
+                        )
+                        if not compressed_side:
+                            self.assertTrue(
+                                torch.equal(
+                                    actual[:, page_size:], expected[:, page_size:]
+                                )
+                            )
+                        elif config.quant_disable:
+                            side = "keys" if is_key else "values"
+                            ratio = config.k_cr if is_key else config.v_cr
+                            reference = FixtureFactory.pca_reference(
+                                expected[:, page_size:],
+                                positions,
+                                artifact[side][config.worker_name],
+                                ratio,
+                                self.rotary,
+                                is_key,
+                                torch,
+                            )
+                            torch.testing.assert_close(
+                                actual[:, page_size:], reference, rtol=0.05, atol=0.05
+                            )
+                        else:
+                            self.assertTrue(
+                                bool(torch.isfinite(actual[:, page_size:]).all())
+                            )
+                finally:
+                    torch.npu.synchronize()
+                    if sink is not None and compressed is not None:
+                        pool.free(torch.cat((sink, compressed)))
+                    del pool
+                    gc.collect()
+
+
+class Test03HiRadixCacheWorkflow(TimedTestCase):
     @classmethod
     def setUpClass(cls):
         cls.config = replace(
@@ -513,12 +706,93 @@ class Test02HiRadixCacheWorkflow(TimedTestCase):
     def tearDownClass(cls):
         cls.torch.npu.synchronize()
         cls.cache.shutdown()
+        atexit.unregister(cls.cache.shutdown)
         del cls.cache, cls.allocator, cls.device_pool
         gc.collect()
         cls.torch.npu.empty_cache()
         if cls.owns_group:
             cls.torch.distributed.destroy_process_group()
             cls.group_dir.cleanup()
+
+    def test_01_sink_only_and_compressed_only_routing(self):
+        torch = self.torch
+        controller = self.cache.cache_controller
+        host_pool = self.cache.token_to_kv_pool_host
+        page_size = self.config.page_size
+        for name, first_position, is_sink in (
+            ("sink only", 0, True),
+            ("compressed only", page_size, False),
+        ):
+            with self.subTest(route=name):
+                before_host = (
+                    host_pool.sink_pool.available_size(),
+                    host_pool.compressed_pool.available_size(),
+                )
+                before_device = len(self.allocator.free_pages)
+                source = self.allocator.alloc(page_size)
+                self.assertIsNotNone(source)
+                loaded = host_indices = None
+                source_released = False
+                try:
+                    positions = torch.arange(
+                        first_position,
+                        first_position + page_size,
+                        device="npu",
+                        dtype=torch.int64,
+                    )
+                    original = FixtureFactory.fill(self.device_pool, source, torch)
+                    host_indices = controller.write(source, positions)
+                    self.assertIsNotNone(host_indices)
+                    controller.ack_write_queue.pop(0).finish_event.synchronize()
+                    if is_sink:
+                        self.assertTrue(
+                            bool((host_indices >= host_pool.sink_token_shift).all())
+                        )
+                    else:
+                        self.assertTrue(
+                            bool((host_indices < host_pool.sink_token_shift).all())
+                        )
+                    self.allocator.free(source)
+                    source_released = True
+                    for buffer in (
+                        self.device_pool.k_buffer,
+                        self.device_pool.v_buffer,
+                    ):
+                        buffer.flatten(1, 2).index_fill_(
+                            1, source.to("npu"), float("nan")
+                        )
+                    torch.npu.synchronize()
+                    loaded = controller.load(host_indices, positions)
+                    self.assertIsNotNone(loaded)
+                    producer = controller.start_loading()
+                    self.assertGreaterEqual(producer, 0)
+                    controller.layer_done_counter.events[
+                        producer
+                    ].finish_event.synchronize()
+                    controller.ack_load_queue.pop(0).finish_event.synchronize()
+                    for actual, expected in zip(
+                        FixtureFactory.read(self.device_pool, loaded), original
+                    ):
+                        if is_sink:
+                            self.assertTrue(torch.equal(actual, expected))
+                        else:
+                            self.assertTrue(bool(torch.isfinite(actual).all()))
+                finally:
+                    torch.npu.synchronize()
+                    if loaded is not None:
+                        controller.evict_device(loaded)
+                    if not source_released:
+                        self.allocator.free(source)
+                    if host_indices is not None:
+                        controller.evict_host(host_indices)
+                self.assertEqual(len(self.allocator.free_pages), before_device)
+                self.assertEqual(
+                    (
+                        host_pool.sink_pool.available_size(),
+                        host_pool.compressed_pool.available_size(),
+                    ),
+                    before_host,
+                )
 
     def test_03_insert_backup_evict_match_reload(self):
         from sglang.srt.managers.cache_controller import KVTCHiCacheController
@@ -576,6 +850,155 @@ class Test02HiRadixCacheWorkflow(TimedTestCase):
         ):
             self.assertTrue(torch.equal(actual[:, :128], expected[:, :128]))
             self.assertTrue(bool(torch.isfinite(actual[:, 128:]).all()))
+
+
+class Test04QuantBatchOrdering(TimedTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.torch, cls.rotary, worker, shape = FixtureFactory.prepare(DEFAULT_CONFIG)
+        from sglang.srt.mem_cache.memory_pool_host import NPUMHATokenToKVPoolCompressed
+
+        cls.page_count = NPUMHATokenToKVPoolCompressed._QUANT_BATCH_MAX_PAGES + 1
+        cls.config = replace(
+            DEFAULT_CONFIG,
+            device_tokens=max(
+                DEFAULT_CONFIG.device_tokens,
+                (cls.page_count + 1) * DEFAULT_CONFIG.page_size,
+            ),
+        )
+        FixtureFactory.prepare(cls.config)
+        cls.device_pool = FixtureFactory.device_pool(cls.config, shape, cls.torch)
+        cls.pool = FixtureFactory.hybrid_pool(
+            cls.config, cls.device_pool, cls.rotary, worker
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.torch.npu.synchronize()
+        del cls.pool, cls.device_pool
+        gc.collect()
+        cls.torch.npu.empty_cache()
+
+    def test_01_out_of_order_host_pages_across_batch_boundary(self):
+        torch = self.torch
+        page_size = self.config.page_size
+        page_count = self.page_count
+        self.assertEqual(
+            page_count, self.pool.compressed_pool._QUANT_BATCH_MAX_PAGES + 1
+        )
+        before = (
+            self.pool.sink_pool.available_size(),
+            self.pool.compressed_pool.available_size(),
+        )
+        sink, allocated = self.pool.alloc(0, (page_count + 1) * page_size)
+        self.assertIsNotNone(sink)
+        self.assertIsNotNone(allocated)
+        self.assertEqual(sink.numel(), 0)
+        device_indices = torch.arange(
+            page_size, (page_count + 1) * page_size, dtype=torch.int64
+        )
+        positions = torch.arange(
+            page_size, 2 * page_size, device="npu", dtype=torch.int64
+        ).repeat(page_count)
+        try:
+            FixtureFactory.fill_distinct_pages(
+                self.device_pool,
+                device_indices,
+                positions,
+                self.pool.compressed_pool,
+                self.rotary,
+                torch,
+            )
+            source_signatures = [
+                FixtureFactory.page_basis_signatures(
+                    values,
+                    positions,
+                    self.pool.compressed_pool,
+                    self.rotary,
+                    matrix,
+                )
+                for matrix, values in zip(
+                    ("k", "v"), FixtureFactory.read(self.device_pool, device_indices)
+                )
+            ]
+            host_pages = allocated.reshape(page_count + 1, page_size)
+            page_ids = [
+                page for page in range(page_count + 1) if page != page_count // 2
+            ][::-1]
+            host_indices = host_pages[page_ids].reshape(-1)
+            request = FixtureFactory.request(
+                self.device_pool,
+                sink_host=sink,
+                compressed_host=host_indices,
+                sink_device=device_indices[:0],
+                compressed_device=device_indices,
+                compressed_tokens=positions,
+            )
+            self.pool.backup_from_device_all_layer(request)
+            torch.npu.synchronize()
+            for buffer in (self.device_pool.k_buffer, self.device_pool.v_buffer):
+                buffer.flatten(1, 2).index_fill_(
+                    1, device_indices.to("npu"), float("nan")
+                )
+            torch.npu.synchronize()
+            FixtureFactory.reload(self.pool, request, torch)
+            reference = [
+                values.clone()
+                for values in FixtureFactory.read(self.device_pool, device_indices)
+            ]
+            for matrix, values, source_signature in zip(
+                ("k", "v"), reference, source_signatures
+            ):
+                self.assertTrue(bool(torch.isfinite(values).all()))
+                self.assertFalse(
+                    torch.equal(
+                        values[:, :page_size], values[:, page_size : 2 * page_size]
+                    )
+                )
+                restored_signature = FixtureFactory.page_basis_signatures(
+                    values,
+                    positions,
+                    self.pool.compressed_pool,
+                    self.rotary,
+                    matrix,
+                )
+                minimum_gap = torch.diff(source_signature).abs().min()
+                self.assertGreater(float(minimum_gap.item()), 0)
+                error = (restored_signature - source_signature).abs()
+                self.assertTrue(bool((error < minimum_gap / 2).all()))
+
+            reversed_pages = list(range(page_count - 1, -1, -1))
+            request.host_indices_compressed = host_indices.reshape(
+                page_count, page_size
+            )[reversed_pages].reshape(-1)
+            for buffer in (self.device_pool.k_buffer, self.device_pool.v_buffer):
+                buffer.flatten(1, 2).index_fill_(
+                    1, device_indices.to("npu"), float("nan")
+                )
+            torch.npu.synchronize()
+            FixtureFactory.reload(self.pool, request, torch)
+            order = torch.tensor(reversed_pages, device="npu", dtype=torch.int64)
+            for actual, expected in zip(
+                FixtureFactory.read(self.device_pool, device_indices), reference
+            ):
+                expected = expected.reshape(
+                    self.device_pool.layer_num,
+                    page_count,
+                    page_size,
+                    self.device_pool.head_num,
+                    self.device_pool.head_dim,
+                ).index_select(1, order).reshape_as(actual)
+                self.assertTrue(torch.equal(actual, expected))
+        finally:
+            torch.npu.synchronize()
+            self.pool.free(allocated)
+        self.assertEqual(
+            (
+                self.pool.sink_pool.available_size(),
+                self.pool.compressed_pool.available_size(),
+            ),
+            before,
+        )
 
 
 if __name__ == "__main__":
