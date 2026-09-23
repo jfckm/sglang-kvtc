@@ -1,7 +1,7 @@
 """Standalone, real-NPU KVTC smoke tests. Edit DEFAULT_CONFIG, then run this file.
 
-No server, model weights, or KV dumps are loaded. The model directory supplies
-only the RoPE configuration; the calibration artifact supplies PCA/quant data.
+No server, model weights, or KV dumps are loaded. The model and calibration
+artifact determine the local KV shape during fixture initialization.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import time
 import unittest
 from array import array
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -27,9 +28,6 @@ class HarnessConfig:
     model_dir: Path = Path("/path/to/local/model")
     artifact_path: Path = Path("/path/to/kvtc-calibration.pt")
     worker_name: str = "tp_0_pp_0"
-    layers: int = 4
-    heads: int = 2
-    head_dim: int = 128
     dtype_name: str = "bfloat16"
     page_size: int = 128
     device_tokens: int = 512
@@ -43,11 +41,28 @@ class HarnessConfig:
 DEFAULT_CONFIG = HarnessConfig()
 
 
+@dataclass(frozen=True)
+class LocalKVShape:
+    layers: int
+    heads: int
+    head_dim: int
+
+
 class FixtureFactory:
     """Keep SGLang constructor and transfer details here for rebases."""
 
     @staticmethod
-    def prepare(config: HarnessConfig):
+    @lru_cache(maxsize=2)
+    def _model_fixture(
+        model_dir: Path,
+        artifact_path: Path,
+        worker_name: str,
+        k_cr: int,
+        v_cr: int,
+        quant_disable: bool,
+        page_size: int,
+        device_index: int,
+    ):
         try:
             import torch
             import torch_npu  # noqa: F401 - registers torch.npu
@@ -57,19 +72,159 @@ class FixtureFactory:
             ) from exc
         if not torch.npu.is_available():
             raise RuntimeError("KVTC harness needs an available Ascend NPU")
-        if not config.model_dir.is_dir():
+        if not model_dir.is_dir():
             raise FileNotFoundError(
                 "Set DEFAULT_CONFIG.model_dir to a local model config directory: "
-                f"{config.model_dir}"
+                f"{model_dir}"
             )
-        if not config.artifact_path.is_file():
+        if not artifact_path.is_file():
             raise FileNotFoundError(
                 "Set DEFAULT_CONFIG.artifact_path to an existing calibration "
-                f"artifact: {config.artifact_path}"
+                f"artifact: {artifact_path}"
             )
-        worker = re.fullmatch(r"tp_(\d+)_pp_(\d+)", config.worker_name)
+        worker = re.fullmatch(r"tp_(\d+)_pp_(\d+)", worker_name)
         if worker is None:
-            raise ValueError(f"Invalid worker_name: {config.worker_name!r}")
+            raise ValueError(f"Invalid worker_name: {worker_name!r}")
+        for side, ratio in (("K", k_cr), ("V", v_cr)):
+            if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio < 0:
+                raise ValueError(
+                    f"{side} compression ratio must be a nonnegative integer"
+                )
+        worker_rank = tuple(map(int, worker.groups()))
+        torch.npu.set_device(device_index)
+
+        from transformers import AutoConfig
+
+        from scripts.kvtc_calibration_data import Rope
+        from sglang.srt.distributed.utils import get_pp_indices
+        from sglang.srt.mem_cache.kvtc_quant import build_quant_layout
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        model = AutoConfig.from_pretrained(
+            str(model_dir), trust_remote_code=False, local_files_only=True
+        )
+        model = getattr(model, "text_config", None) or model
+        num_layers = int(model.num_hidden_layers)
+        num_attention_heads = int(model.num_attention_heads)
+        kv_heads = getattr(model, "num_key_value_heads", None)
+        num_kv_heads = int(num_attention_heads if kv_heads is None else kv_heads)
+        if min(num_layers, num_attention_heads, num_kv_heads) <= 0:
+            raise ValueError("Model KV dimensions must be positive")
+        head_dim = getattr(model, "head_dim", None)
+        if head_dim is None:
+            if model.hidden_size % num_attention_heads:
+                raise ValueError(
+                    "Model hidden size is not divisible by attention heads"
+                )
+            head_dim = model.hidden_size // num_attention_heads
+        head_dim = int(head_dim)
+        if head_dim <= 0:
+            raise ValueError("Model KV head dimension must be positive")
+
+        artifact = torch.load(artifact_path, map_location="cpu", weights_only=True)
+        if not isinstance(artifact, dict):
+            raise ValueError("KVTC calibration artifact must contain a dictionary")
+        worker_sets = []
+        for side, ratio in (("keys", k_cr), ("values", v_cr)):
+            if ratio <= 0:
+                continue
+            entries = artifact.get(side)
+            if not isinstance(entries, dict) or worker_name not in entries:
+                raise ValueError(f"Artifact is missing {side}/{worker_name}")
+            workers = set(entries)
+            if not all(
+                isinstance(name, str) and re.fullmatch(r"tp_\d+_pp_\d+", name)
+                for name in workers
+            ):
+                raise ValueError(f"Artifact {side} has invalid worker names")
+            worker_sets.append(workers)
+        if not worker_sets or any(workers != worker_sets[0] for workers in worker_sets):
+            raise ValueError("Enabled K/V artifact worker sets must match")
+        workers = worker_sets[0]
+        ranks = {
+            tuple(map(int, re.fullmatch(r"tp_(\d+)_pp_(\d+)", name).groups()))
+            for name in workers
+        }
+        tp_size = max(rank[0] for rank in ranks) + 1
+        pp_size = max(rank[1] for rank in ranks) + 1
+        if ranks != {(tp, pp) for tp in range(tp_size) for pp in range(pp_size)}:
+            raise ValueError("Artifact workers must form a complete TP/PP grid")
+        if num_layers < pp_size:
+            raise ValueError("Model has fewer layers than artifact PP workers")
+        if num_kv_heads >= tp_size:
+            if num_kv_heads % tp_size:
+                raise ValueError("Model KV heads are not divisible by artifact TP size")
+        elif tp_size % num_kv_heads:
+            raise ValueError("Artifact TP size cannot replicate model KV heads evenly")
+        start_layer, end_layer = get_pp_indices(num_layers, worker_rank[1], pp_size)
+        shape = LocalKVShape(
+            layers=end_layer - start_layer,
+            heads=max(1, num_kv_heads // tp_size),
+            head_dim=head_dim,
+        )
+        if shape.layers <= 0:
+            raise ValueError("Selected PP worker has no model layers")
+        features = shape.layers * shape.heads * shape.head_dim
+        for side, ratio in (("keys", k_cr), ("values", v_cr)):
+            if ratio <= 0:
+                continue
+            entry = artifact[side][worker_name]
+            if not isinstance(entry, dict):
+                raise ValueError(f"Artifact {side}/{worker_name} is invalid")
+            mu, basis = entry.get("mu"), entry.get("basis")
+            if (
+                not isinstance(mu, torch.Tensor)
+                or mu.shape != (features,)
+                or mu.dtype != torch.float32
+                or not isinstance(basis, torch.Tensor)
+                or basis.ndim != 2
+                or basis.shape[0] != features
+                or basis.shape[1] == 0
+                or basis.dtype != torch.float32
+            ):
+                raise ValueError(
+                    f"Artifact {side}/{worker_name} must have FP32 mu [{features}] "
+                    f"and basis [{features}, rank>0] for local shape {shape}"
+                )
+            if quant_disable:
+                retained_rank = features // ratio
+                if retained_rank == 0:
+                    raise ValueError(
+                        f"{side} compression ratio {ratio} retains no features"
+                    )
+                if basis.shape[1] < retained_rank:
+                    raise ValueError(
+                        f"Artifact {side} basis is too short for ratio {ratio}"
+                    )
+            else:
+                quant = entry.get("quant")
+                if not isinstance(quant, dict):
+                    raise ValueError(
+                        f"Artifact {side}/{worker_name} has no quant schemas"
+                    )
+                build_quant_layout(
+                    quant.get(str(ratio)),
+                    page_size=page_size,
+                    basis_rank=basis.shape[1],
+                    matrix_name=side,
+                )
+
+        # The dummy server arguments avoid server/model initialization. RoPE reads
+        # only config.json through AutoConfig and constructs its position cache.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        Rope.load_model_config(str(model_dir))
+        rotary = Rope.rotary_emb.to(device="npu")
+        if rotary.rotary_dim != shape.head_dim or not rotary.is_neox_style:
+            raise ValueError("KVTC harness requires full-head, NeoX-style 1-D RoPE")
+        if rotary.cos_sin_cache.shape[0] < 256:
+            raise ValueError("Model RoPE cache must cover 256 token positions")
+        return torch, rotary, worker_rank, shape
+
+    @staticmethod
+    def prepare(config: HarnessConfig):
         if (
             config.page_size != 128
             or config.device_tokens < 256
@@ -79,42 +234,32 @@ class FixtureFactory:
                 "This harness uses 128-token pages and a page-aligned device "
                 "capacity of at least 256 tokens"
             )
-        if min(config.layers, config.heads, config.head_dim) <= 0:
-            raise ValueError("layers, heads, and head_dim must be positive")
         if config.dtype_name not in ("float16", "bfloat16"):
             raise ValueError("dtype_name must be 'float16' or 'bfloat16'")
         if config.host_size_gb != 10:
             raise ValueError("This harness uses the production 10 GB hybrid pool")
-        torch.npu.set_device(config.device_index)
-
-        from scripts.kvtc_calibration_data import Rope
-        from sglang.srt.server_args import (
-            ServerArgs,
-            set_global_server_args_for_scheduler,
+        return FixtureFactory._model_fixture(
+            config.model_dir,
+            config.artifact_path,
+            config.worker_name,
+            config.k_cr,
+            config.v_cr,
+            config.quant_disable,
+            config.page_size,
+            config.device_index,
         )
 
-        # The dummy server arguments avoid server/model initialization. RoPE reads
-        # only config.json through AutoConfig and constructs its position cache.
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        Rope.load_model_config(str(config.model_dir))
-        rotary = Rope.rotary_emb.to(device="npu")
-        if rotary.rotary_dim != config.head_dim or not rotary.is_neox_style:
-            raise ValueError("KVTC harness requires full-head, NeoX-style 1-D RoPE")
-        if rotary.cos_sin_cache.shape[0] < 256:
-            raise ValueError("Model RoPE cache must cover 256 token positions")
-        return torch, rotary, tuple(map(int, worker.groups()))
-
     @staticmethod
-    def device_pool(config: HarnessConfig, torch):
+    def device_pool(config: HarnessConfig, shape: LocalKVShape, torch):
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         pool = NPUMHATokenToKVPool(
             size=config.device_tokens,
             page_size=config.page_size,
             dtype=getattr(torch, config.dtype_name),
-            head_num=config.heads,
-            head_dim=config.head_dim,
-            layer_num=config.layers,
+            head_num=shape.heads,
+            head_dim=shape.head_dim,
+            layer_num=shape.layers,
             device="npu",
             enable_memory_saver=False,
             enable_alt_stream=False,
@@ -253,8 +398,8 @@ class Test01HybridPool(TimedTestCase):
     @classmethod
     def setUpClass(cls):
         cls.config = DEFAULT_CONFIG
-        cls.torch, rotary, worker = FixtureFactory.prepare(cls.config)
-        cls.device_pool = FixtureFactory.device_pool(cls.config, cls.torch)
+        cls.torch, rotary, worker, shape = FixtureFactory.prepare(cls.config)
+        cls.device_pool = FixtureFactory.device_pool(cls.config, shape, cls.torch)
         cls.pool = FixtureFactory.hybrid_pool(
             cls.config, cls.device_pool, rotary, worker
         )
@@ -349,7 +494,7 @@ class Test02HiRadixCacheWorkflow(TimedTestCase):
             raise ValueError(
                 "The single-process tree fixture requires worker_name='tp_0_pp_0'"
             )
-        cls.torch, rotary, _ = FixtureFactory.prepare(cls.config)
+        cls.torch, rotary, _, shape = FixtureFactory.prepare(cls.config)
         cls.owns_group = False
         cls.group_dir = None
         if not cls.torch.distributed.is_initialized():
@@ -359,7 +504,7 @@ class Test02HiRadixCacheWorkflow(TimedTestCase):
                 backend="gloo", init_method=init_file.as_uri(), rank=0, world_size=1
             )
             cls.owns_group = True
-        cls.device_pool = FixtureFactory.device_pool(cls.config, cls.torch)
+        cls.device_pool = FixtureFactory.device_pool(cls.config, shape, cls.torch)
         cls.cache, cls.allocator = FixtureFactory.tree(
             cls.config, cls.device_pool, rotary, cls.torch
         )

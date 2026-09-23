@@ -1,11 +1,11 @@
 # KVTC standalone NPU harness
 
 Edit `DEFAULT_CONFIG` in `test_kvtc_harness.py` before running. Set the local
-model directory (for `config.json` and RoPE only), existing KVTC calibration
-artifact, worker name, local layer/head shape, K/V compression ratios, NPU
-index, dtype, and quantization mode to match the artifact. The defaults require
-no command line arguments. The tree test uses a single process, so its worker
-must be `tp_0_pp_0`; keep `quant_disable=False` for the initial quantized suite.
+model directory, existing KVTC calibration artifact, worker name, K/V
+compression ratios, NPU index, dtype, and quantization mode. The defaults
+require no command line arguments. The tree test uses a single process, so its
+worker must be `tp_0_pp_0`; keep `quant_disable=False` for the initial quantized
+suite.
 Run with the active Ascend SGLang environment from the repository root and use
 `time` to check total duration:
 
@@ -20,6 +20,13 @@ may use `dataclasses.replace(DEFAULT_CONFIG, ...)` for a different setup. When
 upstream constructors change after a rebase, update only this factory unless a
 behavioral contract has changed. The tree fixture creates a local one-process
 Gloo group only when no process group exists.
+
+The factory reads the model config and artifact once per model/artifact/worker
+setup. It derives TP/PP sizes from the artifact worker grid, uses SGLang's PP
+layer partition and the model's KV head count to determine the local cache
+shape, and checks the worker's FP32 PCA tensors and quant schemas before pool
+allocation. If calibration used `SGLANG_PP_LAYER_PARTITION`, set the same value
+when running this harness.
 
 The fixture contract is a BF16/FP16 paged MHA cache with 128-token pages,
 full-head NeoX-style one-dimensional RoPE, and a calibration worker whose
