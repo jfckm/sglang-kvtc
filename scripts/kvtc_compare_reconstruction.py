@@ -8,7 +8,6 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -30,9 +29,11 @@ from scripts.kvtc_calibration_quant import (  # noqa: E402
     KVTC_FILE_VERSION,
     _npu_integer_batch_errors,
 )
-from sglang.srt.mem_cache.kvtc_quant import quant_group_bits  # noqa: E402
-from sglang.srt.mem_cache.memory_pool_host import (  # noqa: E402
-    NPUMHATokenToKVPoolCompressed,
+from sglang.srt.mem_cache.kvtc_quant import (  # noqa: E402
+    KVTC_QUANT_METADATA_DTYPE,
+    KVTC_QUANT_STORAGE_DTYPES,
+    KVTCQuantizer,
+    quant_group_bits,
 )
 
 
@@ -123,20 +124,6 @@ def load_config(path: Path) -> dict:
     return config
 
 
-def make_runtime_harness(page_size: int, page_count: int, dtype: torch.dtype):
-    device = torch.device("npu")
-    harness = SimpleNamespace(
-        page_size=page_size,
-        page_num=page_count,
-        device="cpu",
-        dtype=dtype,
-        device_pool=SimpleNamespace(device=device),
-        _QUANT_STORAGE_DTYPES=(NPUMHATokenToKVPoolCompressed._QUANT_STORAGE_DTYPES),
-        _QUANT_METADATA_DTYPE=(NPUMHATokenToKVPoolCompressed._QUANT_METADATA_DTYPE),
-    )
-    return harness
-
-
 def production_quant_roundtrip(
     projected: torch.Tensor,
     matrix_params: dict,
@@ -144,32 +131,73 @@ def production_quant_roundtrip(
     page_size: int,
     cache_dtype: torch.dtype,
     matrix_name: str,
+    artifact_path: str,
 ) -> tuple[torch.Tensor, object]:
     page_count = projected.shape[0] // page_size
-    harness = make_runtime_harness(page_size, page_count, cache_dtype)
-    layout = NPUMHATokenToKVPoolCompressed._load_quant_layout(
-        harness,
-        matrix_params,
-        compression_ratio,
-        matrix_params["basis"].shape[1],
-        matrix_name,
+    ratio_key = str(compression_ratio)
+    quant_configs = matrix_params.get("quant")
+    if not isinstance(quant_configs, dict) or ratio_key not in quant_configs:
+        raise ValueError(
+            f"{matrix_name} KVTC config is missing quantization schema "
+            f"quant[{ratio_key!r}]"
+        )
+    is_key = matrix_name.split("/", 1)[0] == "K"
+    schema = quant_configs[ratio_key]
+    basis_rank = matrix_params["basis"].shape[1]
+    quantizer = KVTCQuantizer(
+        keys_schema=schema if is_key else None,
+        values_schema=None if is_key else schema,
+        keys_basis_rank=basis_rank if is_key else None,
+        values_basis_rank=None if is_key else basis_rank,
+        artifact_path=artifact_path,
+        page_size=page_size,
+        device=projected.device,
+        cache_dtype=cache_dtype,
+        staging_capacity_pages=1,
     )
-    payloads, scales, offsets = NPUMHATokenToKVPoolCompressed._allocate_quant_buffers(
-        harness, layout
+    layout = quantizer.key_layout() if is_key else quantizer.value_layout()
+    payloads = {
+        dtype_name: torch.empty(
+            (page_count, count),
+            dtype=KVTC_QUANT_STORAGE_DTYPES[dtype_name],
+            device="cpu",
+            pin_memory=True,
+        )
+        for dtype_name, count in layout.payload_elements.items()
+    }
+    metadata_shape = (page_count, page_size, layout.metadata_count)
+    scales = torch.empty(
+        metadata_shape, dtype=KVTC_QUANT_METADATA_DTYPE, pin_memory=True
+    )
+    offsets = torch.empty(
+        metadata_shape, dtype=KVTC_QUANT_METADATA_DTYPE, pin_memory=True
+    )
+    quantize_pages = (
+        quantizer.quantize_pages_keys if is_key else quantizer.quantize_pages_values
+    )
+    dequantize_pages = (
+        quantizer.dequantize_pages_keys if is_key else quantizer.dequantize_pages_values
     )
 
     reconstructed = []
     for page in range(page_count):
         page_values = projected[page * page_size : (page + 1) * page_size]
-        NPUMHATokenToKVPoolCompressed._quantize_page(
-            harness, page_values, page, layout, payloads, scales, offsets
-        )
-        reconstructed.append(
-            NPUMHATokenToKVPoolCompressed._dequantize_page(
-                harness, page, layout, payloads, scales, offsets
-            )
-        )
+        host_page = torch.tensor([page], dtype=torch.int64)
+        quantize_pages(page_values.unsqueeze(0), host_page, payloads, scales, offsets)
+        reconstructed.append(dequantize_pages(host_page, payloads, scales, offsets)[0])
     return torch.cat(reconstructed), layout
+
+
+def layout_groups(layout):
+    return sorted(
+        (
+            group
+            for grouped in (layout.direct_storage_groups, layout.integer_quant_groups)
+            for groups in grouped.values()
+            for group in groups
+        ),
+        key=lambda group: group.feature_start,
+    )
 
 
 def reconstruct_cutoff(
@@ -203,7 +231,7 @@ def measure_group_errors(
     layout: object,
 ) -> list[GroupMetrics]:
     results = []
-    for group in layout.groups:
+    for group in layout_groups(layout):
         source = projected[:, group.feature_start : group.feature_end]
         runtime = reconstructed[:, group.feature_start : group.feature_end]
         production_sse = float((source - runtime).square().sum().item())
@@ -348,17 +376,13 @@ def run() -> None:
                 args.page_size,
                 cache_dtype,
                 f"{kv.name}/{worker}",
+                str(args.config),
             )
             dp_reconstructed = (
                 dp_coefficients.to(basis.dtype) @ basis[:, : layout.feature_count].T
                 + mean
             )
-            dp_bits = sum(
-                quant_group_bits(
-                    group.feature_end - group.feature_start, group.dtype_name
-                )
-                for group in layout.groups
-            )
+            dp_bits = layout.bytes_per_token * 8
             group_metrics = measure_group_errors(
                 projected, dp_coefficients, layout
             )
@@ -490,7 +514,7 @@ def run() -> None:
                             group.feature_end - group.feature_start,
                             group.dtype_name,
                         ]
-                        for group in layout.groups
+                        for group in layout_groups(layout)
                     ],
                     "basis": basis_metrics,
                     "pca_floor_sse": pca_floor_metrics.sse,

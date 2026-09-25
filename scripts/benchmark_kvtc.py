@@ -693,7 +693,6 @@ def run_mode(args, mode, device_pool, keys, values, rotary_emb):
         kvtc_k_compression_ratio=0 if baseline else args.k_cr,
         kvtc_v_compression_ratio=0 if baseline else args.v_cr,
         kvtc_quant_disable=mode.name == "compressed",
-        kvtc_quant_debug=False,
         rotary_emb=rotary_emb,
         tp_rank=tp_rank,
         pp_rank=pp_rank,

@@ -61,8 +61,8 @@ class TestKVTCQuantizerNPU(unittest.TestCase):
         host_pages = torch.tensor([3, 0], dtype=torch.int64)
         k_source = torch.randn(2, 128, 28, device=device)
         v_source = torch.randn(2, 128, 8, device=device)
-        k_host = host_buffers(quantizer._keys.layout, page_count=4)
-        v_host = host_buffers(quantizer._values.layout, page_count=4)
+        k_host = host_buffers(quantizer.key_layout(), page_count=4)
+        v_host = host_buffers(quantizer.value_layout(), page_count=4)
 
         quantizer.quantize_pages_keys(k_source, host_pages, *k_host)
         quantizer.quantize_pages_values(v_source, host_pages, *v_host)

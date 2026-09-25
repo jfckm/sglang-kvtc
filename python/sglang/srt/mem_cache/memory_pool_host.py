@@ -41,12 +41,9 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.mem_cache.kvtc_quant import (
     KVTC_QUANT_METADATA_DTYPE,
-    KVTC_QUANT_PRECISION_BITS,
     KVTC_QUANT_STORAGE_DTYPES,
-    KVTCQuantGroup as _KVTCQuantGroup,
-    KVTCQuantLayout as _KVTCQuantLayout,
-    build_quant_layout,
-    quant_group_bits,
+    KVTCQuantGroupedLayout as _KVTCQuantGroupedLayout,
+    KVTCQuantizer,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu, get_available_gpu_memory
 
@@ -3292,10 +3289,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
     # Bound the projected pages retained on the NPU before quantization/offload.
     _QUANT_BATCH_MAX_PAGES = 32
 
-    _QUANT_STORAGE_DTYPES = KVTC_QUANT_STORAGE_DTYPES
-    _QUANT_PRECISION_BITS = KVTC_QUANT_PRECISION_BITS
-    _QUANT_METADATA_DTYPE = KVTC_QUANT_METADATA_DTYPE
-
     @staticmethod
     def _validate_pca_storage_dtype(dtype: torch.dtype) -> None:
         if dtype not in (torch.float16, torch.bfloat16):
@@ -3314,7 +3307,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
         kvtc_quant_disable: bool = False,
-        kvtc_quant_debug: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
         tp_size: int = 1,
@@ -3328,9 +3320,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.compressed_dtype = device_pool.dtype
         self.kvtc_quant_disable = kvtc_quant_disable
-        self.kvtc_quant_debug = kvtc_quant_debug
-        self._kvtc_quant_debugged_pages = set()
-        self._kvtc_quant_debugged_activity = set()
         if self.kvtc_quant_disable:
             self._validate_pca_storage_dtype(self.compressed_dtype)
         self.rotary_emb = rotary_emb
@@ -3351,24 +3340,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
         self.k_kvtc = False
         self.v_kvtc = False
-        self.k_quant_layout = None
-        self.v_quant_layout = None
-        self._dequant_indices_by_layout = {}
-        self._dequant_payload_staging = {}
-
-        if getattr(self, "kvtc_quant_debug", False):
-            logger.info(
-                "[KVTC-QUANT-DIAG] torch=%s torch_npu=%s cache_dtype=%s "
-                "store_dtype=%s page_size=%s has_torch_int4=%s "
-                "has_torch_quint4x2=%s",
-                torch.__version__,
-                getattr(torch_npu, "__version__", "<unknown>"),
-                self.compressed_dtype,
-                self.dtype,
-                self.page_size,
-                hasattr(torch, "int4"),
-                hasattr(torch, "quint4x2"),
-            )
+        self.quantizer = None
 
         p = self.layer_num * self.head_num * self.head_dim
 
@@ -3384,25 +3356,50 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             self.v_kvtc = "values" in kvtc_params and kvtc_v_compression_ratio > 0
 
             worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
+            keys_params = kvtc_params["keys"].get(worker_key) if self.k_kvtc else None
+            values_params = kvtc_params["values"].get(worker_key) if self.v_kvtc else None
+            if self.k_kvtc and keys_params is None:
+                raise Exception(f"Wrong K KVTC config - missing {worker_key}")
+            if self.v_kvtc and values_params is None:
+                raise Exception(f"Wrong V KVTC config - missing {worker_key}")
+
+            if not self.kvtc_quant_disable and (self.k_kvtc or self.v_kvtc):
+                self.quantizer = KVTCQuantizer(
+                    keys_schema=(
+                        self._load_quant_schema(
+                            keys_params, kvtc_k_compression_ratio, f"K/{worker_key}"
+                        )
+                        if self.k_kvtc
+                        else None
+                    ),
+                    values_schema=(
+                        self._load_quant_schema(
+                            values_params, kvtc_v_compression_ratio, f"V/{worker_key}"
+                        )
+                        if self.v_kvtc
+                        else None
+                    ),
+                    keys_basis_rank=(
+                        keys_params["basis"].shape[1] if self.k_kvtc else None
+                    ),
+                    values_basis_rank=(
+                        values_params["basis"].shape[1] if self.v_kvtc else None
+                    ),
+                    artifact_path=kvtc_params_path,
+                    page_size=self.page_size,
+                    device=self.device_pool.device,
+                    cache_dtype=self.dtype,
+                    staging_capacity_pages=self._QUANT_BATCH_MAX_PAGES,
+                )
 
             if self.k_kvtc:
                 logger.info(
                     f"NPU compressed K basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
-                keys_params = kvtc_params["keys"].get(worker_key)
-                if keys_params is None:
-                    raise Exception(f"Wrong K KVTC config - missing {worker_key}")
-
                 if self.kvtc_quant_disable:
                     k_dim_limit = p // int(kvtc_k_compression_ratio)
                 else:
-                    self.k_quant_layout = self._load_quant_layout(
-                        keys_params,
-                        kvtc_k_compression_ratio,
-                        keys_params["basis"].shape[1],
-                        f"K/{worker_key}",
-                    )
-                    k_dim_limit = self.k_quant_layout.feature_count
+                    k_dim_limit = self.quantizer.key_layout().feature_count
 
                 self.kvtc_k_mu = self._copy_with_trim(keys_params["mu"])
 
@@ -3426,20 +3423,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 logger.info(
                     f"NPU compressed V basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
-                values_params = kvtc_params["values"].get(worker_key)
-                if values_params is None:
-                    raise Exception(f"Wrong V KVTC config - missing {worker_key}")
-
                 if self.kvtc_quant_disable:
                     v_dim_limit = p // int(kvtc_v_compression_ratio)
                 else:
-                    self.v_quant_layout = self._load_quant_layout(
-                        values_params,
-                        kvtc_v_compression_ratio,
-                        values_params["basis"].shape[1],
-                        f"V/{worker_key}",
-                    )
-                    v_dim_limit = self.v_quant_layout.feature_count
+                    v_dim_limit = self.quantizer.value_layout().feature_count
 
                 self.kvtc_v_mu = self._copy_with_trim(values_params["mu"])
 
@@ -3458,13 +3445,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 logger.debug(
                     f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
                 )
-
-            if not self.kvtc_quant_disable:
-                for layout in (self.k_quant_layout, self.v_quant_layout):
-                    if layout is not None:
-                        self._dequant_indices_by_layout[id(layout)] = (
-                            self._build_dequant_indices(layout)
-                        )
 
             torch_npu.npu.synchronize()
 
@@ -3489,122 +3469,29 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-    def _load_quant_layout(
-        self,
+    @staticmethod
+    def _load_quant_schema(
         matrix_params: dict,
         compression_ratio: float,
-        basis_rank: int,
         matrix_name: str,
-    ) -> _KVTCQuantLayout:
+    ) -> object:
         ratio = float(compression_ratio)
         if ratio <= 0 or not ratio.is_integer():
             raise ValueError(
                 f"{matrix_name} KVTC compression ratio must be a positive integer, got {compression_ratio}"
             )
-
         quant_configs = matrix_params.get("quant")
         ratio_key = str(int(ratio))
         if not isinstance(quant_configs, dict) or ratio_key not in quant_configs:
             raise ValueError(
                 f"{matrix_name} KVTC config is missing quantization schema quant[{ratio_key!r}]"
             )
-
-        schema = quant_configs[ratio_key]
-        layout = build_quant_layout(
-            schema,
-            page_size=self.page_size,
-            basis_rank=basis_rank,
-            matrix_name=matrix_name,
-        )
-
-        if getattr(self, "kvtc_quant_debug", False):
-            original_feature_count = self.layer_num * self.head_num * self.head_dim
-            used_bits = sum(
-                quant_group_bits(
-                    group.feature_end - group.feature_start,
-                    group.dtype_name,
-                )
-                for group in layout.groups
-            )
-            logger.info(
-                "[KVTC-QUANT-DIAG] matrix=%s ratio=%s basis_rank=%s "
-                "retained=%s bits_per_token=%s effective_ratio=%.4fx groups=%s",
-                matrix_name,
-                int(ratio),
-                basis_rank,
-                layout.feature_count,
-                used_bits,
-                16 * original_feature_count / used_bits,
-                [
-                    (
-                        group.feature_end - group.feature_start,
-                        group.dtype_name,
-                    )
-                    for group in layout.groups
-                ],
-            )
-
-        missing_ops = (
-            [
-                op
-                for op in ("npu_dynamic_quant_asymmetric", "npu_anti_quant")
-                if not hasattr(torch_npu, op)
-            ]
-            if layout.metadata_count > 0
-            else []
-        )
-        if missing_ops:
-            raise RuntimeError(
-                f"{matrix_name} KVTC quantization requires missing torch-npu APIs: {', '.join(missing_ops)}"
-            )
-        if layout.metadata_count > 0 and self.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                f"{matrix_name} KVTC quantization requires an FP16 or BF16 device KV cache, got {self.dtype}"
-            )
-
-        return layout
-
-    def _build_dequant_indices(
-        self, layout: _KVTCQuantLayout
-    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        groups_by_dtype = defaultdict(list)
-        for group in layout.groups:
-            if group.metadata_index is not None:
-                groups_by_dtype[group.dtype_name].append(group)
-
-        device = self.device_pool.device
-        indices_by_dtype = {}
-        for dtype_name, groups in groups_by_dtype.items():
-            payload_indices = []
-            for token_index in range(self.page_size):
-                for group in groups:
-                    packed_width = (
-                        group.payload_end - group.payload_start
-                    ) // self.page_size
-                    token_start = group.payload_start + token_index * packed_width
-                    payload_indices.extend(
-                        range(token_start, token_start + packed_width)
-                    )
-
-            feature_indices = []
-            metadata_indices = []
-            for group in groups:
-                group_size = group.feature_end - group.feature_start
-                feature_indices.extend(range(group.feature_start, group.feature_end))
-                metadata_indices.extend([group.metadata_index] * group_size)
-
-            indices_by_dtype[dtype_name] = (
-                torch.tensor(payload_indices, dtype=torch.long, device=device),
-                torch.tensor(metadata_indices, dtype=torch.long, device=device),
-                torch.tensor(feature_indices, dtype=torch.long, device=device),
-            )
-
-        return indices_by_dtype
+        return quant_configs[ratio_key]
 
     def _get_matrix_page_size_bytes(
         self,
         enabled: bool,
-        layout: Optional[_KVTCQuantLayout],
+        matrix_name: str,
         feature_count: Optional[int] = None,
     ) -> int:
         if not enabled:
@@ -3620,26 +3507,22 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             assert feature_count is not None
             return self.page_size * feature_count * self.compressed_dtype.itemsize
 
-        payload_bytes = sum(
-            element_count * self._QUANT_STORAGE_DTYPES[dtype_name].itemsize
-            for dtype_name, element_count in layout.payload_elements.items()
+        assert self.quantizer is not None
+        bytes_per_token = (
+            self.quantizer.key_bytes_per_token()
+            if matrix_name == "K"
+            else self.quantizer.value_bytes_per_token()
         )
-        metadata_bytes = (
-            self.page_size
-            * layout.metadata_count
-            * 2
-            * self._QUANT_METADATA_DTYPE.itemsize
-        )
-        return payload_bytes + metadata_bytes
+        return self.page_size * bytes_per_token
 
     def _get_page_size_bytes(self) -> int:
         return self._get_matrix_page_size_bytes(
             self.k_kvtc,
-            self.k_quant_layout,
+            "K",
             self.offload_page_shape_k[1] if self.k_kvtc else None,
         ) + self._get_matrix_page_size_bytes(
             self.v_kvtc,
-            self.v_quant_layout,
+            "V",
             self.offload_page_shape_v[1] if self.v_kvtc else None,
         )
 
@@ -3647,12 +3530,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         baseline_bytes = feature_count * self.dtype.itemsize
         k_bytes = self._get_matrix_page_size_bytes(
             self.k_kvtc,
-            self.k_quant_layout,
+            "K",
             self.offload_page_shape_k[1] if self.k_kvtc else None,
         ) / self.page_size
         v_bytes = self._get_matrix_page_size_bytes(
             self.v_kvtc,
-            self.v_quant_layout,
+            "V",
             self.offload_page_shape_v[1] if self.v_kvtc else None,
         ) / self.page_size
         logger.info(
@@ -3668,11 +3551,11 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
         return in_tensor[out_slices].to(self.device_pool.device)
 
-    def _allocate_quant_buffers(self, layout: _KVTCQuantLayout):
+    def _allocate_quant_buffers(self, layout: _KVTCQuantGroupedLayout):
         payload_buffers = {
             dtype_name: torch.zeros(
                 (self.page_num, element_count),
-                dtype=self._QUANT_STORAGE_DTYPES[dtype_name],
+                dtype=KVTC_QUANT_STORAGE_DTYPES[dtype_name],
                 device=self.device,
                 pin_memory=True,
             )
@@ -3681,68 +3564,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         metadata_shape = (self.page_num, self.page_size, layout.metadata_count)
         scales = torch.zeros(
             metadata_shape,
-            dtype=self._QUANT_METADATA_DTYPE,
+            dtype=KVTC_QUANT_METADATA_DTYPE,
             device=self.device,
             pin_memory=True,
         )
         offsets = torch.zeros_like(scales)
         return payload_buffers, scales, offsets
 
-    def _allocate_dequant_payload_staging(
-        self,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        staging = {
-            dtype_name: torch.empty(
-                (self._QUANT_BATCH_MAX_PAGES, element_count),
-                dtype=self._QUANT_STORAGE_DTYPES[dtype_name],
-                device=self.device_pool.device,
-            )
-            for dtype_name, element_count in layout.payload_elements.items()
-        }
-        self._dequant_payload_staging[(id(layout), id(payload_buffers))] = staging
-        return staging
-
-    def _get_dequant_payload_staging(
-        self,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        # The lazy fallback keeps reconstruction/debugging helpers that supply
-        # their own payload buffers working while normal K/V buffers are
-        # registered eagerly in init_kv_buffer().
-        staging_by_source = getattr(self, "_dequant_payload_staging", None)
-        if staging_by_source is None:
-            self._dequant_payload_staging = {}
-            staging_by_source = self._dequant_payload_staging
-        key = (id(layout), id(payload_buffers))
-        if key not in staging_by_source:
-            return self._allocate_dequant_payload_staging(layout, payload_buffers)
-        return staging_by_source[key]
-
-    @staticmethod
-    def _stage_dequant_payloads(
-        host_page_list: list[int],
-        num_pages: int,
-        payload_buffers: dict[str, torch.Tensor],
-        payload_staging: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        device_payloads = {}
-        for dtype_name, payload_buffer in payload_buffers.items():
-            staged_payload = payload_staging[dtype_name][:num_pages]
-            for dst_page, src_page in enumerate(host_page_list):
-                staged_payload[dst_page].copy_(
-                    payload_buffer[src_page], non_blocking=True
-                )
-            device_payloads[dtype_name] = staged_payload
-        return device_payloads
-
     def init_kv_buffer(self):
         logger.info(f"NPU compressed pool alloc begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
-        # Hybrid-pool initialization can rebuild the backing buffers. Drop any
-        # staging tensors associated with the previous K/V payload dictionaries.
-        self._dequant_payload_staging = {}
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -3752,10 +3582,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.k_quant_buffers,
                 self.k_quant_scales,
                 self.k_quant_offsets,
-            ) = self._allocate_quant_buffers(self.k_quant_layout)
-            self._allocate_dequant_payload_staging(
-                self.k_quant_layout, self.k_quant_buffers
-            )
+            ) = self._allocate_quant_buffers(self.quantizer.key_layout())
             self.k_buffer = self.k_quant_buffers
         elif self.k_kvtc:
             self.k_buffer = torch.zeros(
@@ -3783,10 +3610,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.v_quant_buffers,
                 self.v_quant_scales,
                 self.v_quant_offsets,
-            ) = self._allocate_quant_buffers(self.v_quant_layout)
-            self._allocate_dequant_payload_staging(
-                self.v_quant_layout, self.v_quant_buffers
-            )
+            ) = self._allocate_quant_buffers(self.quantizer.value_layout())
             self.v_buffer = self.v_quant_buffers
         elif self.v_kvtc:
             self.v_buffer = torch.zeros(
@@ -3818,308 +3642,10 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         return (
             self._get_matrix_page_size_bytes(
                 self.k_kvtc,
-                self.k_quant_layout,
+                "K",
                 self.offload_page_shape_k[1] if self.k_kvtc else None,
             )
             / self.page_size
-        )
-
-    def _quantize_page(
-        self,
-        X: torch.Tensor,
-        host_page: int,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-        scales: torch.Tensor,
-        offsets: torch.Tensor,
-    ) -> None:
-        # Keep the single-page entry point for reconstruction/debugging tools.
-        NPUMHATokenToKVPoolCompressed._quantize_pages(
-            self,
-            X.unsqueeze(0),
-            torch.as_tensor(host_page, device="cpu", dtype=torch.int64).reshape(1),
-            layout,
-            payload_buffers,
-            scales,
-            offsets,
-        )
-
-    def _quantize_pages(
-        self,
-        X: torch.Tensor,
-        host_pages: torch.Tensor,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-        scales: torch.Tensor,
-        offsets: torch.Tensor,
-    ) -> None:
-        """Quantize [pages, tokens, features], preserving the per-page storage layout.
-
-        host_pages contains CPU int64 destination page IDs in X's page order.
-        Quantization reduces only the feature dimension, so every token/group
-        retains its own scale and offset even when pages are batched together.
-        """
-        num_pages = X.shape[0]
-        if num_pages == 0:
-            return
-        X = X.flatten(0, 1)
-        quantized_by_dtype = defaultdict(list)
-        group_scales = []
-        group_offsets = []
-        X_cast = X.to(self.dtype)
-
-        for group in layout.groups:
-            if group.dtype_name in ("float32", "bfloat16"):
-                group_values = X[:, group.feature_start : group.feature_end]
-                quantized_by_dtype[group.dtype_name].append(
-                    group_values.reshape(num_pages, -1).to(
-                        dtype=self._QUANT_STORAGE_DTYPES[group.dtype_name]
-                    )
-                )
-                continue
-
-            group_values = X_cast[:, group.feature_start : group.feature_end]
-            dst_type = (
-                torch.quint4x2 if group.dtype_name == "int4" else torch.int8
-            )
-            quantized, scale, quant_offset = torch_npu.npu_dynamic_quant_asymmetric(
-                group_values, dst_type=dst_type
-            )
-            quantized_by_dtype[group.dtype_name].append(
-                quantized.reshape(num_pages, -1)
-            )
-            group_scales.append(scale.reshape(num_pages, self.page_size))
-            # npu_anti_quant computes (q + offset) * scale, while the dynamic
-            # quantizer returns q = round(x / scale + offset).
-            group_offsets.append((-quant_offset).reshape(num_pages, self.page_size))
-
-        # Concatenate within each page, not across flattened page/group pairs.
-        for dtype_name, chunks in quantized_by_dtype.items():
-            host_payload = torch.cat(chunks, dim=1).to(device=self.device)
-            payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
-        if group_scales:
-            host_scales = torch.stack(group_scales, dim=2).to(
-                device=self.device, dtype=self._QUANT_METADATA_DTYPE
-            )
-            host_offsets = torch.stack(group_offsets, dim=2).to(
-                device=self.device, dtype=self._QUANT_METADATA_DTYPE
-            )
-            scales.index_copy_(0, host_pages, host_scales)
-            offsets.index_copy_(0, host_pages, host_offsets)
-
-    def _dequantize_page(
-        self,
-        host_page: int,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-        scales: torch.Tensor,
-        offsets: torch.Tensor,
-    ) -> torch.Tensor:
-        return self._dequantize_pages(
-            torch.as_tensor(host_page, device="cpu", dtype=torch.int64).reshape(1),
-            layout,
-            payload_buffers,
-            scales,
-            offsets,
-        )[0]
-
-    def _dequantize_pages(
-        self,
-        host_pages: torch.Tensor,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-        scales: torch.Tensor,
-        offsets: torch.Tensor,
-    ) -> torch.Tensor:
-        """Restore a batch of host pages in the order given by host_pages."""
-        num_pages = host_pages.numel()
-        device = self.device_pool.device
-        if num_pages == 0:
-            return torch.empty(
-                (0, self.page_size, layout.feature_count),
-                dtype=torch.float32,
-                device=device,
-            )
-        payload_staging = self._get_dequant_payload_staging(
-            layout, payload_buffers
-        )
-        staging_capacity = next(iter(payload_staging.values())).shape[0]
-        if num_pages > staging_capacity:
-            raise ValueError(
-                f"KVTC dequantization batch has {num_pages} pages, but payload "
-                f"staging is limited to {staging_capacity}"
-            )
-        host_page_list = host_pages.tolist()
-        host_scales = scales.index_select(0, host_pages)
-        host_offsets = offsets.index_select(0, host_pages)
-        device_payloads = self._stage_dequant_payloads(
-            host_page_list,
-            num_pages,
-            payload_buffers,
-            payload_staging,
-        )
-        device_scales = host_scales.to(device=device, dtype=torch.float32, non_blocking=True)
-        device_offsets = host_offsets.to(device=device, dtype=torch.float32, non_blocking=True)
-        X = torch.empty(
-            (num_pages, self.page_size, layout.feature_count),
-            dtype=torch.float32,
-            device=device,
-        )
-
-        for group in layout.groups:
-            if group.dtype_name in ("float32", "bfloat16"):
-                group_payload = device_payloads[group.dtype_name][
-                    :, group.payload_start : group.payload_end
-                ]
-                X[:, :, group.feature_start : group.feature_end] = (
-                    group_payload.reshape(
-                        num_pages,
-                        self.page_size,
-                        group.feature_end - group.feature_start,
-                    )
-                )
-
-        indices_by_dtype = self._dequant_indices_by_layout[id(layout)]
-        for (
-            dtype_name,
-            (payload_indices, metadata_indices, feature_indices),
-        ) in indices_by_dtype.items():
-
-            payload = device_payloads[dtype_name].index_select(
-                1, payload_indices
-            ).reshape(1, -1)
-
-            # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
-            # views with nonzero storage offsets. Keep this guard after packing so
-            # the exact tensor passed to npu_anti_quant is materialized if needed.
-            if dtype_name == "int4" and payload.storage_offset() != 0:
-                payload = payload.clone()
-
-            expanded_scales = device_scales.index_select(
-                2, metadata_indices
-            ).reshape(-1)
-            expanded_offsets = device_offsets.index_select(
-                2, metadata_indices
-            ).reshape(-1)
-            kwargs = {
-                "offset": expanded_offsets,
-                "dst_dtype": self.dtype,
-            }
-            if dtype_name == "int4" and hasattr(torch, "int4"):
-                kwargs["src_dtype"] = torch.quint4x2
-            dequantized = torch_npu.npu_anti_quant(
-                payload,
-                expanded_scales,
-                **kwargs,
-            )
-            X[:, :, feature_indices] = dequantized.to(dtype=X.dtype).reshape(
-                num_pages,
-                self.page_size,
-                feature_indices.numel(),
-            )
-
-        return X
-
-    def _log_quant_page_diagnostics(
-        self,
-        matrix_name: str,
-        source: torch.Tensor,
-        host_page: int,
-        layout: _KVTCQuantLayout,
-        payload_buffers: dict[str, torch.Tensor],
-        scales: torch.Tensor,
-        offsets: torch.Tensor,
-    ) -> None:
-        if not self.kvtc_quant_debug or matrix_name in self._kvtc_quant_debugged_pages:
-            return
-        self._kvtc_quant_debugged_pages.add(matrix_name)
-
-        reconstructed = self._dequantize_page(
-            host_page,
-            layout,
-            payload_buffers,
-            scales,
-            offsets,
-        )
-        retained_source = source[:, : layout.feature_count].to(torch.float32)
-        total_energy = float(retained_source.square().sum().item())
-        total_error = float(
-            (retained_source - reconstructed).square().sum().item()
-        )
-        source_nonfinite = int((~torch.isfinite(retained_source)).sum().item())
-        reconstructed_nonfinite = int(
-            (~torch.isfinite(reconstructed)).sum().item()
-        )
-        logger.info(
-            "[KVTC-QUANT-DIAG] matrix=%s first_quantized_page=%s "
-            "energy=%.7g roundtrip_sse=%.7g relative_error=%.7g "
-            "source_nonfinite=%s reconstructed_nonfinite=%s",
-            matrix_name,
-            host_page,
-            total_energy,
-            total_error,
-            (total_error / total_energy) ** 0.5 if total_energy > 0 else 0.0,
-            source_nonfinite,
-            reconstructed_nonfinite,
-        )
-
-        for group_index, group in enumerate(layout.groups):
-            group_source = retained_source[
-                :, group.feature_start : group.feature_end
-            ]
-            group_reconstructed = reconstructed[
-                :, group.feature_start : group.feature_end
-            ]
-            energy = float(group_source.square().sum().item())
-            error = float(
-                (group_source - group_reconstructed).square().sum().item()
-            )
-            metadata = ""
-            if group.metadata_index is not None:
-                group_scales = scales[host_page, :, group.metadata_index].to(
-                    torch.float32
-                )
-                group_offsets = offsets[host_page, :, group.metadata_index].to(
-                    torch.float32
-                )
-                metadata = (
-                    f" scale_min={float(group_scales.min().item()):.7g}"
-                    f" scale_max={float(group_scales.max().item()):.7g}"
-                    f" offset_min={float(group_offsets.min().item()):.7g}"
-                    f" offset_max={float(group_offsets.max().item()):.7g}"
-                    f" metadata_nonfinite="
-                    f"{int((~torch.isfinite(group_scales)).sum().item() + (~torch.isfinite(group_offsets)).sum().item())}"
-                )
-            logger.info(
-                "[KVTC-QUANT-DIAG] matrix=%s group=%s range=%s:%s "
-                "dtype=%s bits=%s energy=%.7g roundtrip_sse=%.7g "
-                "relative_error=%.7g%s",
-                matrix_name,
-                group_index,
-                group.feature_start,
-                group.feature_end,
-                group.dtype_name,
-                quant_group_bits(
-                    group.feature_end - group.feature_start,
-                    group.dtype_name,
-                ),
-                energy,
-                error,
-                (error / energy) ** 0.5 if energy > 0 else 0.0,
-                metadata,
-            )
-
-    def _log_quant_activity(self, operation: str, page_count: int) -> None:
-        if (
-            not self.kvtc_quant_debug
-            or operation in self._kvtc_quant_debugged_activity
-        ):
-            return
-        self._kvtc_quant_debugged_activity.add(operation)
-        logger.info(
-            "[KVTC-QUANT-DIAG] first_%s page_count=%s",
-            operation,
-            page_count,
         )
 
     def load_to_device_per_layer(
@@ -4137,7 +3663,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         assert len(token_indices) == host_indices.size(0)
         assert(device_indices.size(0) % self.page_size == 0)
         num_pages = device_indices.size(0) // self.page_size
-        self._log_quant_activity("load", num_pages)
         token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
         for batch_start in range(0, num_pages, self._QUANT_BATCH_MAX_PAGES):
@@ -4152,9 +3677,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
             D_k_pages = None
             if self.k_kvtc and not self.kvtc_quant_disable:
-                D_k_pages = self._dequantize_pages(
+                D_k_pages = self.quantizer.dequantize_pages_keys(
                     host_pages,
-                    self.k_quant_layout,
                     self.k_quant_buffers,
                     self.k_quant_scales,
                     self.k_quant_offsets,
@@ -4162,9 +3686,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
             D_v_pages = None
             if self.v_kvtc and not self.kvtc_quant_disable:
-                D_v_pages = self._dequantize_pages(
+                D_v_pages = self.quantizer.dequantize_pages_values(
                     host_pages,
-                    self.v_quant_layout,
                     self.v_quant_buffers,
                     self.v_quant_scales,
                     self.v_quant_offsets,
@@ -4344,7 +3867,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         assert len(token_indices) == host_indices.size(0), f"{len(token_indices)=} {host_indices.size(0)}"
         assert (device_indices.size(0) % self.page_size == 0)
         num_pages = device_indices.size(0) // self.page_size
-        self._log_quant_activity("backup", num_pages)
         token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
 
         projected_k_pages = []
@@ -4399,20 +3921,18 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 ).to(device="cpu", dtype=torch.int64)
                 if projected_k_pages:
                     self._backup_quantized_batch(
-                        "K",
                         projected_k_pages,
                         host_pages,
-                        self.k_quant_layout,
+                        self.quantizer.quantize_pages_keys,
                         self.k_quant_buffers,
                         self.k_quant_scales,
                         self.k_quant_offsets,
                     )
                 if projected_v_pages:
                     self._backup_quantized_batch(
-                        "V",
                         projected_v_pages,
                         host_pages,
-                        self.v_quant_layout,
+                        self.quantizer.quantize_pages_values,
                         self.v_quant_buffers,
                         self.v_quant_scales,
                         self.v_quant_offsets,
@@ -4421,26 +3941,16 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
     def _backup_quantized_batch(
         self,
-        matrix_name: str,
         projected_pages: list[torch.Tensor],
         host_pages: torch.Tensor,
-        layout: _KVTCQuantLayout,
+        quantize_pages: Callable[..., None],
         payload_buffers: dict[str, torch.Tensor],
         scales: torch.Tensor,
         offsets: torch.Tensor,
     ) -> None:
         X = torch.stack(projected_pages)
         projected_pages.clear()
-        self._quantize_pages(X, host_pages, layout, payload_buffers, scales, offsets)
-        self._log_quant_page_diagnostics(
-            matrix_name,
-            X[0],
-            host_pages[0],
-            layout,
-            payload_buffers,
-            scales,
-            offsets,
-        )
+        quantize_pages(X, host_pages, payload_buffers, scales, offsets)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         raise NotImplementedError()
@@ -4484,7 +3994,6 @@ class NPUMHATokenToKVPoolHybrid:
         kvtc_k_compression_ratio: float = 0,
         kvtc_v_compression_ratio: float = 0,
         kvtc_quant_disable: bool = False,
-        kvtc_quant_debug: bool = False,
         enable_memory_saver: bool = False,
         rotary_emb = None,
         tp_rank: int = 0,
@@ -4511,7 +4020,6 @@ class NPUMHATokenToKVPoolHybrid:
                 kvtc_k_compression_ratio=kvtc_k_compression_ratio,
                 kvtc_v_compression_ratio=kvtc_v_compression_ratio,
                 kvtc_quant_disable=kvtc_quant_disable,
-                kvtc_quant_debug=kvtc_quant_debug,
                 rotary_emb=rotary_emb,
                 tp_rank=tp_rank,
                 tp_size=tp_size,

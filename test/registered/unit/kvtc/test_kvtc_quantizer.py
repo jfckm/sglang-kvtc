@@ -143,6 +143,10 @@ class TestKVTCQuantizer(unittest.TestCase):
             RuntimeError, "values quantization is not initialized"
         ):
             quantizer.value_bytes_per_token()
+        with self.assertRaisesRegex(
+            RuntimeError, "values quantization is not initialized"
+        ):
+            quantizer.value_layout()
         empty_ids = torch.empty(0, dtype=torch.int64)
         empty_pages = torch.empty(0, 2, 8)
         with self.assertRaisesRegex(
@@ -153,7 +157,7 @@ class TestKVTCQuantizer(unittest.TestCase):
             RuntimeError, "values quantization is not initialized"
         ):
             quantizer.dequantize_pages_values(empty_ids, {}, None, None)
-        buffers = host_buffers(quantizer._keys.layout)
+        buffers = host_buffers(quantizer.key_layout())
         quantizer.quantize_pages_keys(empty_pages, empty_ids, *buffers)
         self.assertEqual(
             tuple(quantizer.dequantize_pages_keys(empty_ids, *buffers).shape),
@@ -166,12 +170,12 @@ class TestKVTCQuantizer(unittest.TestCase):
                 values_schema=[(3, "float32"), (2, "bfloat16")]
             )
         self.assertEqual(quantizer.value_bytes_per_token(), 16)
-        self.assertEqual(quantizer._values.layout.metadata_count, 0)
+        self.assertEqual(quantizer.value_layout().metadata_count, 0)
         self.assertIsNone(quantizer._keys)
         self.assertEqual(set(quantizer._values.staging), {"float32", "bfloat16"})
         source = torch.randn(1, 2, 5)
         host_pages = torch.tensor([4], dtype=torch.int64)
-        buffers = host_buffers(quantizer._values.layout)
+        buffers = host_buffers(quantizer.value_layout())
         quantizer.quantize_pages_values(source, host_pages, *buffers)
         restored = quantizer.dequantize_pages_values(host_pages, *buffers)
         torch.testing.assert_close(restored[:, :, :3], source[:, :, :3], rtol=0, atol=0)
@@ -202,7 +206,11 @@ class TestKVTCQuantizer(unittest.TestCase):
         ids = torch.tensor([5, 1, 3], dtype=torch.int64)
 
         for name, schema in (("keys", keys_schema), ("values", values_schema)):
-            layout = getattr(quantizer, f"_{name}").layout
+            layout = (
+                quantizer.key_layout()
+                if name == "keys"
+                else quantizer.value_layout()
+            )
             source = torch.randn(3, 2, layout.feature_count)
             actual = host_buffers(layout)
             expected = host_buffers(layout)

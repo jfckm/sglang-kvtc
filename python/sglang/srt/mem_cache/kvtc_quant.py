@@ -429,6 +429,12 @@ class KVTCQuantizer:
     def value_bytes_per_token(self) -> int:
         return self._require_side(self._values, "values").layout.bytes_per_token
 
+    def key_layout(self) -> KVTCQuantGroupedLayout:
+        return self._require_side(self._keys, "keys").layout
+
+    def value_layout(self) -> KVTCQuantGroupedLayout:
+        return self._require_side(self._values, "values").layout
+
     def quantize_pages_keys(
         self,
         pages: torch.Tensor,

@@ -567,18 +567,29 @@ class Test01HybridPool(TimedTestCase):
             self.pool.free(torch.cat((sink, compressed)))
 
     def test_03_quantized_groups_are_offloaded(self):
+        from sglang.srt.mem_cache.kvtc_quant import KVTCQuantizer
+
         torch = self.torch
         compressed_pool = self.pool.compressed_pool
+        self.assertIsInstance(compressed_pool.quantizer, KVTCQuantizer)
         matrices = (
-            ("K", compressed_pool.k_quant_layout, compressed_pool.k_quant_scales),
-            ("V", compressed_pool.v_quant_layout, compressed_pool.v_quant_scales),
+            (
+                "K",
+                compressed_pool.quantizer.key_layout(),
+                compressed_pool.k_quant_scales,
+            ),
+            (
+                "V",
+                compressed_pool.quantizer.value_layout(),
+                compressed_pool.v_quant_scales,
+            ),
         )
         # Require both integer storage types so this test covers either being skipped.
         quantized_groups = [
             (matrix, scales, group)
             for matrix, layout, scales in matrices
-            for group in layout.groups
-            if group.dtype_name in ("int4", "int8")
+            for groups in layout.integer_quant_groups.values()
+            for group in groups
         ]
         self.assertEqual(
             {group.dtype_name for _, _, group in quantized_groups},
