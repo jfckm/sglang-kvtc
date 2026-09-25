@@ -1,8 +1,13 @@
-"""CPU checks for the independent dtype-grouped KVTC layout builder."""
+"""CPU checks for the dtype-grouped KVTC quantizer layout."""
 
 import runpy
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -12,15 +17,30 @@ QUANT = runpy.run_path(
 
 
 class TestKVTCQuantGroupedLayout(unittest.TestCase):
+    def build_new(self, schema, *, page_size, basis_rank):
+        npu_ops = types.ModuleType("torch_npu")
+        npu_ops.npu_dynamic_quant_asymmetric = Mock()
+        npu_ops.npu_anti_quant = Mock()
+        with patch.dict(sys.modules, {"torch_npu": npu_ops}):
+            quantizer = QUANT["KVTCQuantizer"](
+                keys_schema=schema,
+                values_schema=None,
+                keys_basis_rank=basis_rank,
+                values_basis_rank=None,
+                artifact_path="test.pt",
+                page_size=page_size,
+                device="cpu",
+                cache_dtype=torch.bfloat16,
+                staging_capacity_pages=1,
+            )
+        return quantizer._keys.layout
+
     def build_both(self, schema, *, page_size=128, basis_rank=64):
-        kwargs = {
-            "page_size": page_size,
-            "basis_rank": basis_rank,
-            "matrix_name": "test",
-        }
         return (
-            QUANT["build_quant_layout"](schema, **kwargs),
-            QUANT["build_quant_layout_new"](schema, **kwargs),
+            QUANT["build_quant_layout"](
+                schema, page_size=page_size, basis_rank=basis_rank, matrix_name="keys"
+            ),
+            self.build_new(schema, page_size=page_size, basis_rank=basis_rank),
         )
 
     def test_interleaved_dtypes_keep_feature_and_metadata_positions(self):
@@ -61,6 +81,7 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         self.assertEqual(new.feature_count, old.feature_count)
         self.assertEqual(new.metadata_count, old.metadata_count)
         self.assertEqual(new.payload_elements, old.payload_elements)
+        self.assertEqual(new.bytes_per_token, 53)
         self.assertEqual(
             sorted(
                 (
@@ -84,6 +105,7 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         self.assertEqual(new.integer_quant_groups["int8"], old.groups)
         self.assertEqual(new.payload_elements, {"int8": 24})
         self.assertEqual(new.metadata_count, 2)
+        self.assertEqual(new.bytes_per_token, 20)
 
     def test_float_groups_need_no_metadata(self):
         old, new = self.build_both([(3, "bfloat16"), (2, "float32")])
@@ -98,6 +120,7 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
             [None, None],
         )
         self.assertEqual(new.payload_elements, old.payload_elements)
+        self.assertEqual(new.bytes_per_token, 14)
 
     def test_validation_matches_existing_builder(self):
         invalid = [
@@ -112,17 +135,16 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         ]
         for schema, basis_rank in invalid:
             with self.subTest(schema=schema, basis_rank=basis_rank):
-                errors = []
-                for builder_name in ("build_quant_layout", "build_quant_layout_new"):
-                    with self.assertRaises(ValueError) as caught:
-                        QUANT[builder_name](
-                            schema,
-                            page_size=128,
-                            basis_rank=basis_rank,
-                            matrix_name="test",
-                        )
-                    errors.append(str(caught.exception))
-                self.assertEqual(*errors)
+                with self.assertRaises(ValueError) as old_error:
+                    QUANT["build_quant_layout"](
+                        schema,
+                        page_size=128,
+                        basis_rank=basis_rank,
+                        matrix_name="keys",
+                    )
+                with self.assertRaises(ValueError) as new_error:
+                    self.build_new(schema, page_size=128, basis_rank=basis_rank)
+                self.assertEqual(str(old_error.exception), str(new_error.exception))
 
 
 if __name__ == "__main__":

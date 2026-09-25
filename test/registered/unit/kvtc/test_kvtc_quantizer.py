@@ -15,7 +15,6 @@ QUANT = runpy.run_path(
     str(ROOT / "python/sglang/srt/mem_cache/kvtc_quant.py")
 )
 KVTCQuantizer = QUANT["KVTCQuantizer"]
-build_quant_layout_new = QUANT["build_quant_layout_new"]
 
 
 def dynamic_quant(values, *, dst_type):
@@ -203,9 +202,7 @@ class TestKVTCQuantizer(unittest.TestCase):
         ids = torch.tensor([5, 1, 3], dtype=torch.int64)
 
         for name, schema in (("keys", keys_schema), ("values", values_schema)):
-            layout = build_quant_layout_new(
-                schema, page_size=2, basis_rank=64, matrix_name=name
-            )
+            layout = getattr(quantizer, f"_{name}").layout
             source = torch.randn(3, 2, layout.feature_count)
             actual = host_buffers(layout)
             expected = host_buffers(layout)
