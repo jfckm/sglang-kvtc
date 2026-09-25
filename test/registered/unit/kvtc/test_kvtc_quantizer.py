@@ -60,54 +60,58 @@ def host_buffers(layout, page_count=8):
     )
 
 
+def layout_groups(layout):
+    for groups_by_dtype in (
+        layout.direct_storage_groups,
+        layout.integer_quant_groups,
+    ):
+        for dtype_name, groups in groups_by_dtype.items():
+            for group in groups:
+                yield dtype_name, group
+
+
 def reference_pages(source, host_pages, layout, target, cache_dtype):
     payloads, scales, offsets = target
     for page, host_page in zip(source, host_pages):
-        for dtype_name, groups in layout.groups_by_dtype.items():
-            for group in groups:
-                values = page[:, group.feature_start : group.feature_end]
-                if group.metadata_index is None:
-                    quantized = values.to(
-                        QUANT["KVTC_QUANT_STORAGE_DTYPES"][dtype_name]
-                    )
-                else:
-                    dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
-                    quantized, scale, offset = dynamic_quant(
-                        values.to(cache_dtype), dst_type=dst_type
-                    )
-                    scales[host_page, :, group.metadata_index] = scale
-                    offsets[host_page, :, group.metadata_index] = -offset
-                payloads[dtype_name][
-                    host_page, group.payload_start : group.payload_end
-                ] = quantized.flatten()
+        for dtype_name, group in layout_groups(layout):
+            values = page[:, group.feature_start : group.feature_end]
+            if group.metadata_index is None:
+                quantized = values.to(QUANT["KVTC_QUANT_STORAGE_DTYPES"][dtype_name])
+            else:
+                dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
+                quantized, scale, offset = dynamic_quant(
+                    values.to(cache_dtype), dst_type=dst_type
+                )
+                scales[host_page, :, group.metadata_index] = scale
+                offsets[host_page, :, group.metadata_index] = -offset
+            payloads[dtype_name][
+                host_page, group.payload_start : group.payload_end
+            ] = quantized.flatten()
 
 
 def reference_restore(host_pages, layout, source, cache_dtype):
     payloads, scales, offsets = source
     result = torch.empty((len(host_pages), 2, layout.feature_count))
     for output_page, host_page in enumerate(host_pages):
-        for dtype_name, groups in layout.groups_by_dtype.items():
-            for group in groups:
-                width = group.feature_end - group.feature_start
-                payload = payloads[dtype_name][
-                    host_page, group.payload_start : group.payload_end
-                ]
-                if group.metadata_index is None:
-                    values = payload.reshape(2, width)
-                else:
-                    scale = scales[host_page, :, group.metadata_index]
-                    offset = offsets[host_page, :, group.metadata_index]
-                    expanded_scale = scale.repeat_interleave(width).float()
-                    expanded_offset = offset.repeat_interleave(width).float()
-                    values = anti_quant(
-                        payload.reshape(1, -1),
-                        expanded_scale,
-                        offset=expanded_offset,
-                        dst_dtype=cache_dtype,
-                    ).reshape(2, width)
-                result[
-                    output_page, :, group.feature_start : group.feature_end
-                ] = values
+        for dtype_name, group in layout_groups(layout):
+            width = group.feature_end - group.feature_start
+            payload = payloads[dtype_name][
+                host_page, group.payload_start : group.payload_end
+            ]
+            if group.metadata_index is None:
+                values = payload.reshape(2, width)
+            else:
+                scale = scales[host_page, :, group.metadata_index]
+                offset = offsets[host_page, :, group.metadata_index]
+                expanded_scale = scale.repeat_interleave(width).float()
+                expanded_offset = offset.repeat_interleave(width).float()
+                values = anti_quant(
+                    payload.reshape(1, -1),
+                    expanded_scale,
+                    offset=expanded_offset,
+                    dst_dtype=cache_dtype,
+                ).reshape(2, width)
+            result[output_page, :, group.feature_start : group.feature_end] = values
     return result
 
 
@@ -177,14 +181,11 @@ class TestKVTCQuantizer(unittest.TestCase):
             rtol=0, atol=0,
         )
 
-    def test_both_sides_disabled_allocate_no_staging(self):
-        quantizer = self.make_quantizer()
-        self.assertIsNone(quantizer._keys)
-        self.assertIsNone(quantizer._values)
+    def test_constructor_requires_at_least_one_schema(self):
         with self.assertRaisesRegex(
-            RuntimeError, "keys quantization is not initialized"
+            ValueError, "requires a keys or values schema"
         ):
-            quantizer.key_bytes_per_token()
+            self.make_quantizer()
 
     def test_mixed_sides_match_reference_and_preserve_host_order(self):
         keys_schema = [
@@ -193,10 +194,11 @@ class TestKVTCQuantizer(unittest.TestCase):
             (5, "int8"),
             (16, "int4"),
             (2, "bfloat16"),
+            (1, "float32"),
         ]
         values_schema = [(4, "int8")]
         quantizer = self.make_quantizer(keys_schema, values_schema)
-        self.assertEqual(quantizer.key_bytes_per_token(), 8 + 12 + 9 + 12 + 4)
+        self.assertEqual(quantizer.key_bytes_per_token(), 8 + 12 + 9 + 12 + 4 + 4)
         self.assertEqual(quantizer.value_bytes_per_token(), 8)
         ids = torch.tensor([5, 1, 3], dtype=torch.int64)
 

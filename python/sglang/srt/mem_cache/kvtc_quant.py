@@ -46,7 +46,8 @@ class KVTCQuantLayout:
 
 @dataclass(frozen=True)
 class KVTCQuantGroupedLayout:
-    groups_by_dtype: dict[str, tuple[KVTCQuantGroup, ...]]
+    direct_storage_groups: dict[str, tuple[KVTCQuantGroup, ...]]
+    integer_quant_groups: dict[str, tuple[KVTCQuantGroup, ...]]
     feature_count: int
     payload_elements: dict[str, int]
     metadata_count: int
@@ -148,7 +149,14 @@ def build_quant_layout_new(
             f"{matrix_name} KVTC quantization schema must be a non-empty list"
         )
 
-    groups_by_dtype = {name: [] for name in KVTC_QUANT_STORAGE_DTYPES}
+    direct_storage_groups = {
+        name: []
+        for name in KVTC_QUANT_STORAGE_DTYPES
+        if name not in KVTC_QUANTIZED_DTYPES
+    }
+    integer_quant_groups = {
+        name: [] for name in KVTC_QUANT_STORAGE_DTYPES if name in KVTC_QUANTIZED_DTYPES
+    }
     feature_offset = 0
     metadata_count = 0
     payload_offsets = {name: 0 for name in KVTC_QUANT_STORAGE_DTYPES}
@@ -193,7 +201,12 @@ def build_quant_layout_new(
 
         payload_start = payload_offsets[dtype_name]
         payload_end = payload_start + payload_elements
-        groups_by_dtype[dtype_name].append(
+        groups = (
+            integer_quant_groups
+            if dtype_name in KVTC_QUANTIZED_DTYPES
+            else direct_storage_groups
+        )
+        groups[dtype_name].append(
             KVTCQuantGroup(
                 feature_start=feature_offset,
                 feature_end=feature_offset + group_size,
@@ -214,9 +227,14 @@ def build_quant_layout_new(
         )
 
     return KVTCQuantGroupedLayout(
-        groups_by_dtype={
+        direct_storage_groups={
             name: tuple(groups)
-            for name, groups in groups_by_dtype.items()
+            for name, groups in direct_storage_groups.items()
+            if groups
+        },
+        integer_quant_groups={
+            name: tuple(groups)
+            for name, groups in integer_quant_groups.items()
             if groups
         },
         feature_count=feature_offset,
@@ -256,6 +274,8 @@ class KVTCQuantizer:
         cache_dtype: torch.dtype,
         staging_capacity_pages: int,
     ) -> None:
+        if keys_schema is None and values_schema is None:
+            raise ValueError("KVTC quantizer requires a keys or values schema")
         if page_size <= 0 or staging_capacity_pages <= 0:
             raise ValueError("KVTC page size and staging capacity must be positive")
 
@@ -330,17 +350,24 @@ class KVTCQuantizer:
             if side is None:
                 continue
             layout = side.layout
+            direct_group_counts = {
+                dtype: len(groups)
+                for dtype, groups in layout.direct_storage_groups.items()
+            }
+            integer_group_counts = {
+                dtype: len(groups)
+                for dtype, groups in layout.integer_quant_groups.items()
+            }
             logger.info(
                 "KVTC quantizer %s basis_rank=%d retained=%d groups=%d "
-                "groups_by_dtype=%s bytes_per_token=%d",
+                "direct_storage_groups=%s integer_quant_groups=%s "
+                "bytes_per_token=%d",
                 name,
                 side.basis_rank,
                 layout.feature_count,
-                sum(map(len, layout.groups_by_dtype.values())),
-                {
-                    dtype: len(groups)
-                    for dtype, groups in layout.groups_by_dtype.items()
-                },
+                sum(direct_group_counts.values()) + sum(integer_group_counts.values()),
+                direct_group_counts,
+                integer_group_counts,
                 side.bytes_per_token,
             )
             if logger.isEnabledFor(logging.DEBUG):
@@ -348,7 +375,7 @@ class KVTCQuantizer:
                     "KVTC quantizer %s schema=%s layout=%s",
                     name,
                     schema,
-                    layout.groups_by_dtype,
+                    layout,
                 )
 
     def _initialize_side(
@@ -359,7 +386,11 @@ class KVTCQuantizer:
         assert basis_rank is not None
         used_bits = sum(
             quant_group_bits(group.feature_end - group.feature_start, dtype_name)
-            for dtype_name, groups in layout.groups_by_dtype.items()
+            for groups_by_dtype in (
+                layout.direct_storage_groups,
+                layout.integer_quant_groups,
+            )
+            for dtype_name, groups in groups_by_dtype.items()
             for group in groups
         )
         if used_bits % 8:
@@ -385,9 +416,7 @@ class KVTCQuantizer:
         self, layout: KVTCQuantGroupedLayout
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         indices_by_dtype = {}
-        for dtype_name, groups in layout.groups_by_dtype.items():
-            if dtype_name not in KVTC_QUANTIZED_DTYPES:
-                continue
+        for dtype_name, groups in layout.integer_quant_groups.items():
             payload_indices = []
             for token_index in range(self.page_size):
                 for group in groups:
@@ -464,17 +493,27 @@ class KVTCQuantizer:
             return
         layout = side.layout
         flat = pages.flatten(0, 1)
-        cast = flat.to(self.cache_dtype) if layout.metadata_count else None
-        group_scales = [None] * layout.metadata_count
-        group_offsets = [None] * layout.metadata_count
 
-        for dtype_name, groups in layout.groups_by_dtype.items():
-            chunks = []
-            for group in groups:
-                if dtype_name in KVTC_QUANTIZED_DTYPES:
-                    assert cast is not None and self._npu_ops is not None
+        for dtype_name, groups in layout.direct_storage_groups.items():
+            chunks = [
+                flat[:, group.feature_start : group.feature_end]
+                .reshape(num_pages, -1)
+                .to(KVTC_QUANT_STORAGE_DTYPES[dtype_name])
+                for group in groups
+            ]
+            host_payload = torch.cat(chunks, dim=1).to(device="cpu")
+            payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
+
+        if layout.integer_quant_groups:
+            assert self._npu_ops is not None
+            cast = flat.to(self.cache_dtype)
+            group_scales = [None] * layout.metadata_count
+            group_offsets = [None] * layout.metadata_count
+            for dtype_name, groups in layout.integer_quant_groups.items():
+                chunks = []
+                dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
+                for group in groups:
                     values = cast[:, group.feature_start : group.feature_end]
-                    dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
                     quantized, scale, quant_offset = (
                         self._npu_ops.npu_dynamic_quant_asymmetric(
                             values, dst_type=dst_type
@@ -490,17 +529,9 @@ class KVTCQuantizer:
                     group_offsets[metadata_index] = (-quant_offset).reshape(
                         num_pages, self.page_size
                     )
-                else:
-                    values = flat[:, group.feature_start : group.feature_end]
-                    chunks.append(
-                        values.reshape(num_pages, -1).to(
-                            KVTC_QUANT_STORAGE_DTYPES[dtype_name]
-                        )
-                    )
-            host_payload = torch.cat(chunks, dim=1).to(device="cpu")
-            payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
+                host_payload = torch.cat(chunks, dim=1).to(device="cpu")
+                payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
 
-        if layout.metadata_count:
             host_scales = torch.stack(group_scales, dim=2).to(
                 device="cpu", dtype=KVTC_QUANT_METADATA_DTYPE
             )
@@ -571,8 +602,8 @@ class KVTCQuantizer:
             dtype=torch.float32,
             device=self.device,
         )
-        for dtype_name in ("float32", "bfloat16"):
-            for group in layout.groups_by_dtype.get(dtype_name, ()):
+        for dtype_name, groups in layout.direct_storage_groups.items():
+            for group in groups:
                 payload = device_payloads[dtype_name][
                     :, group.payload_start : group.payload_end
                 ]

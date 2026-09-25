@@ -34,13 +34,16 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         ]
         old, new = self.build_both(schema)
 
-        self.assertEqual(
-            list(new.groups_by_dtype), ["float32", "bfloat16", "int8", "int4"]
-        )
+        self.assertEqual(list(new.direct_storage_groups), ["float32", "bfloat16"])
+        self.assertEqual(list(new.integer_quant_groups), ["int8", "int4"])
         self.assertEqual(
             {
                 dtype: [group.feature_start for group in groups]
-                for dtype, groups in new.groups_by_dtype.items()
+                for groups_by_dtype in (
+                    new.direct_storage_groups,
+                    new.integer_quant_groups,
+                )
+                for dtype, groups in groups_by_dtype.items()
             },
             {
                 "float32": [0],
@@ -60,7 +63,15 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         self.assertEqual(new.payload_elements, old.payload_elements)
         self.assertEqual(
             sorted(
-                (group for groups in new.groups_by_dtype.values() for group in groups),
+                (
+                    group
+                    for groups_by_dtype in (
+                        new.direct_storage_groups,
+                        new.integer_quant_groups,
+                    )
+                    for groups in groups_by_dtype.values()
+                    for group in groups
+                ),
                 key=lambda group: group.feature_start,
             ),
             list(old.groups),
@@ -68,18 +79,20 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
 
     def test_single_dtype_keeps_separate_groups(self):
         old, new = self.build_both([(5, "int8"), (7, "int8")], page_size=2)
-        self.assertEqual(list(new.groups_by_dtype), ["int8"])
-        self.assertEqual(new.groups_by_dtype["int8"], old.groups)
+        self.assertEqual(new.direct_storage_groups, {})
+        self.assertEqual(list(new.integer_quant_groups), ["int8"])
+        self.assertEqual(new.integer_quant_groups["int8"], old.groups)
         self.assertEqual(new.payload_elements, {"int8": 24})
         self.assertEqual(new.metadata_count, 2)
 
     def test_float_groups_need_no_metadata(self):
         old, new = self.build_both([(3, "bfloat16"), (2, "float32")])
         self.assertEqual(new.metadata_count, 0)
+        self.assertEqual(new.integer_quant_groups, {})
         self.assertEqual(
             [
                 group.metadata_index
-                for groups in new.groups_by_dtype.values()
+                for groups in new.direct_storage_groups.values()
                 for group in groups
             ],
             [None, None],
