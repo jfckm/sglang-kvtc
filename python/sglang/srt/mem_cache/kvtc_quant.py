@@ -39,6 +39,14 @@ class KVTCQuantLayout:
     metadata_count: int
 
 
+@dataclass(frozen=True)
+class KVTCQuantGroupedLayout:
+    groups_by_dtype: dict[str, tuple[KVTCQuantGroup, ...]]
+    feature_count: int
+    payload_elements: dict[str, int]
+    metadata_count: int
+
+
 def quant_group_bits(group_size: int, dtype_name: str) -> int:
     """Return per-token storage, including one FP16 scale/offset pair."""
     bits = group_size * KVTC_QUANT_PRECISION_BITS[dtype_name]
@@ -118,5 +126,97 @@ def build_quant_layout(
         groups=tuple(groups),
         feature_count=feature_offset,
         payload_elements={name: count for name, count in payload_offsets.items() if count},
+        metadata_count=metadata_count,
+    )
+
+
+def build_quant_layout_new(
+    schema: object,
+    *,
+    page_size: int,
+    basis_rank: int,
+    matrix_name: str,
+) -> KVTCQuantGroupedLayout:
+    """Build a layout grouped by storage dtype, preserving PCA feature ranges."""
+    if not isinstance(schema, (list, tuple)) or not schema:
+        raise ValueError(
+            f"{matrix_name} KVTC quantization schema must be a non-empty list"
+        )
+
+    groups_by_dtype = {name: [] for name in KVTC_QUANT_STORAGE_DTYPES}
+    feature_offset = 0
+    metadata_count = 0
+    payload_offsets = {name: 0 for name in KVTC_QUANT_STORAGE_DTYPES}
+    for group_index, entry in enumerate(schema):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError(
+                f"{matrix_name} KVTC quantization entry {group_index} "
+                "must be (group_size, dtype)"
+            )
+
+        group_size, dtype_name = entry
+        if (
+            isinstance(group_size, bool)
+            or not isinstance(group_size, int)
+            or group_size <= 0
+        ):
+            raise ValueError(
+                f"{matrix_name} KVTC quantization group {group_index} "
+                f"has invalid size {group_size!r}"
+            )
+        if dtype_name not in KVTC_QUANT_STORAGE_DTYPES:
+            raise ValueError(
+                f"{matrix_name} KVTC quantization group {group_index} "
+                f"has unsupported dtype {dtype_name!r}"
+            )
+        if dtype_name == "int4":
+            if group_size < 8 or group_size % 8 != 0:
+                raise ValueError(
+                    f"{matrix_name} KVTC int4 group {group_index} "
+                    f"has size {group_size}; "
+                    "packed int4 requires a group size of at least 8 "
+                    "and a multiple of 8"
+                )
+            payload_elements = page_size * group_size // 8
+        else:
+            payload_elements = page_size * group_size
+
+        metadata_index = None
+        if dtype_name in KVTC_QUANTIZED_DTYPES:
+            metadata_index = metadata_count
+            metadata_count += 1
+
+        payload_start = payload_offsets[dtype_name]
+        payload_end = payload_start + payload_elements
+        groups_by_dtype[dtype_name].append(
+            KVTCQuantGroup(
+                feature_start=feature_offset,
+                feature_end=feature_offset + group_size,
+                dtype_name=dtype_name,
+                payload_start=payload_start,
+                payload_end=payload_end,
+                metadata_index=metadata_index,
+            )
+        )
+        feature_offset += group_size
+        payload_offsets[dtype_name] = payload_end
+
+    if feature_offset > basis_rank:
+        raise ValueError(
+            f"{matrix_name} KVTC quantization schema retains "
+            f"{feature_offset} features, "
+            f"but basis rank is only {basis_rank}"
+        )
+
+    return KVTCQuantGroupedLayout(
+        groups_by_dtype={
+            name: tuple(groups)
+            for name, groups in groups_by_dtype.items()
+            if groups
+        },
+        feature_count=feature_offset,
+        payload_elements={
+            name: count for name, count in payload_offsets.items() if count
+        },
         metadata_count=metadata_count,
     )
