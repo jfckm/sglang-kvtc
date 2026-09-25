@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from importlib import import_module
 
 import torch
+
+
+logger = logging.getLogger(__name__)
 
 
 KVTC_QUANT_STORAGE_DTYPES = {
@@ -220,3 +225,444 @@ def build_quant_layout_new(
         },
         metadata_count=metadata_count,
     )
+
+
+@dataclass(frozen=True)
+class _KVTCQuantSide:
+    layout: KVTCQuantGroupedLayout
+    basis_rank: int
+    bytes_per_token: int
+    staging: dict[str, torch.Tensor]
+    dequant_indices: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
+class KVTCQuantizer:
+    """Quantize projected K/V pages into caller-owned host buffers.
+
+    The K/V schemas and staging capacity are fixed at construction. Calls that
+    share one side's staging must be serialized on the caller's device stream.
+    """
+
+    def __init__(
+        self,
+        *,
+        keys_schema: object | None,
+        values_schema: object | None,
+        keys_basis_rank: int | None,
+        values_basis_rank: int | None,
+        artifact_path: str,
+        page_size: int,
+        device: torch.device | str,
+        cache_dtype: torch.dtype,
+        staging_capacity_pages: int,
+    ) -> None:
+        if page_size <= 0 or staging_capacity_pages <= 0:
+            raise ValueError("KVTC page size and staging capacity must be positive")
+
+        self.page_size = page_size
+        self.device = device
+        self.cache_dtype = cache_dtype
+        self.staging_capacity_pages = staging_capacity_pages
+        self._npu_ops = None
+
+        layouts = {}
+        for name, schema, rank in (
+            ("keys", keys_schema, keys_basis_rank),
+            ("values", values_schema, values_basis_rank),
+        ):
+            if schema is None:
+                if rank is not None:
+                    raise ValueError(f"KVTC {name} basis rank requires a schema")
+                layouts[name] = None
+                continue
+            if rank is None:
+                raise ValueError(f"KVTC {name} schema requires a basis rank")
+            layouts[name] = build_quant_layout_new(
+                schema,
+                page_size=page_size,
+                basis_rank=rank,
+                matrix_name=name,
+            )
+
+        if any(
+            layout is not None and layout.metadata_count > 0
+            for layout in layouts.values()
+        ):
+            if cache_dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "KVTC integer quantization requires an FP16 or BF16 cache, "
+                    f"got {cache_dtype}"
+                )
+            try:
+                self._npu_ops = import_module("torch_npu")
+            except ImportError as error:
+                raise RuntimeError(
+                    "KVTC integer quantization requires torch_npu"
+                ) from error
+            missing = [
+                name
+                for name in ("npu_dynamic_quant_asymmetric", "npu_anti_quant")
+                if not hasattr(self._npu_ops, name)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "KVTC integer quantization requires torch_npu APIs: "
+                    + ", ".join(missing)
+                )
+
+        self._keys = self._initialize_side(layouts["keys"], keys_basis_rank)
+        self._values = self._initialize_side(layouts["values"], values_basis_rank)
+
+        logger.info(
+            "KVTC quantizer artifact=%s staging_capacity_pages=%d enabled=%s",
+            artifact_path,
+            staging_capacity_pages,
+            [
+                name
+                for name, side in (("keys", self._keys), ("values", self._values))
+                if side is not None
+            ],
+        )
+        for name, side, schema in (
+            ("keys", self._keys, keys_schema),
+            ("values", self._values, values_schema),
+        ):
+            if side is None:
+                continue
+            layout = side.layout
+            logger.info(
+                "KVTC quantizer %s basis_rank=%d retained=%d groups=%d "
+                "groups_by_dtype=%s bytes_per_token=%d",
+                name,
+                side.basis_rank,
+                layout.feature_count,
+                sum(map(len, layout.groups_by_dtype.values())),
+                {
+                    dtype: len(groups)
+                    for dtype, groups in layout.groups_by_dtype.items()
+                },
+                side.bytes_per_token,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KVTC quantizer %s schema=%s layout=%s",
+                    name,
+                    schema,
+                    layout.groups_by_dtype,
+                )
+
+    def _initialize_side(
+        self, layout: KVTCQuantGroupedLayout | None, basis_rank: int | None
+    ) -> _KVTCQuantSide | None:
+        if layout is None:
+            return None
+        assert basis_rank is not None
+        used_bits = sum(
+            quant_group_bits(group.feature_end - group.feature_start, dtype_name)
+            for dtype_name, groups in layout.groups_by_dtype.items()
+            for group in groups
+        )
+        if used_bits % 8:
+            raise ValueError("KVTC quantized token size is not byte-aligned")
+        staging = {
+            dtype_name: torch.empty(
+                (self.staging_capacity_pages, element_count),
+                dtype=KVTC_QUANT_STORAGE_DTYPES[dtype_name],
+                device=self.device,
+            )
+            for dtype_name, element_count in layout.payload_elements.items()
+        }
+        dequant_indices = self._build_dequant_indices(layout)
+        return _KVTCQuantSide(
+            layout=layout,
+            basis_rank=basis_rank,
+            bytes_per_token=used_bits // 8,
+            staging=staging,
+            dequant_indices=dequant_indices,
+        )
+
+    def _build_dequant_indices(
+        self, layout: KVTCQuantGroupedLayout
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        indices_by_dtype = {}
+        for dtype_name, groups in layout.groups_by_dtype.items():
+            if dtype_name not in KVTC_QUANTIZED_DTYPES:
+                continue
+            payload_indices = []
+            for token_index in range(self.page_size):
+                for group in groups:
+                    packed_width = (
+                        group.payload_end - group.payload_start
+                    ) // self.page_size
+                    token_start = group.payload_start + token_index * packed_width
+                    payload_indices.extend(
+                        range(token_start, token_start + packed_width)
+                    )
+            feature_indices = []
+            metadata_indices = []
+            for group in groups:
+                group_size = group.feature_end - group.feature_start
+                feature_indices.extend(range(group.feature_start, group.feature_end))
+                metadata_indices.extend([group.metadata_index] * group_size)
+            indices_by_dtype[dtype_name] = (
+                torch.tensor(payload_indices, dtype=torch.long, device=self.device),
+                torch.tensor(metadata_indices, dtype=torch.long, device=self.device),
+                torch.tensor(feature_indices, dtype=torch.long, device=self.device),
+            )
+        return indices_by_dtype
+
+    @staticmethod
+    def _require_side(side: _KVTCQuantSide | None, name: str) -> _KVTCQuantSide:
+        if side is None:
+            raise RuntimeError(f"KVTC {name} quantization is not initialized")
+        return side
+
+    def key_bytes_per_token(self) -> int:
+        return self._require_side(self._keys, "keys").bytes_per_token
+
+    def value_bytes_per_token(self) -> int:
+        return self._require_side(self._values, "values").bytes_per_token
+
+    def quantize_pages_keys(
+        self,
+        pages: torch.Tensor,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        self._quantize_pages(
+            self._keys, "keys", pages, host_pages, payload_buffers, scales, offsets
+        )
+
+    def quantize_pages_values(
+        self,
+        pages: torch.Tensor,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        self._quantize_pages(
+            self._values, "values", pages, host_pages, payload_buffers, scales, offsets
+        )
+
+    def _quantize_pages(
+        self,
+        side: _KVTCQuantSide | None,
+        name: str,
+        pages: torch.Tensor,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        side = self._require_side(side, name)
+        self._validate_pages(pages, host_pages, side.layout)
+        num_pages = pages.shape[0]
+        if num_pages == 0:
+            return
+        layout = side.layout
+        flat = pages.flatten(0, 1)
+        cast = flat.to(self.cache_dtype) if layout.metadata_count else None
+        group_scales = [None] * layout.metadata_count
+        group_offsets = [None] * layout.metadata_count
+
+        for dtype_name, groups in layout.groups_by_dtype.items():
+            chunks = []
+            for group in groups:
+                if dtype_name in KVTC_QUANTIZED_DTYPES:
+                    assert cast is not None and self._npu_ops is not None
+                    values = cast[:, group.feature_start : group.feature_end]
+                    dst_type = torch.quint4x2 if dtype_name == "int4" else torch.int8
+                    quantized, scale, quant_offset = (
+                        self._npu_ops.npu_dynamic_quant_asymmetric(
+                            values, dst_type=dst_type
+                        )
+                    )
+                    chunks.append(quantized.reshape(num_pages, -1))
+                    metadata_index = group.metadata_index
+                    assert metadata_index is not None
+                    group_scales[metadata_index] = scale.reshape(
+                        num_pages, self.page_size
+                    )
+                    # npu_anti_quant reconstructs (q + offset) * scale.
+                    group_offsets[metadata_index] = (-quant_offset).reshape(
+                        num_pages, self.page_size
+                    )
+                else:
+                    values = flat[:, group.feature_start : group.feature_end]
+                    chunks.append(
+                        values.reshape(num_pages, -1).to(
+                            KVTC_QUANT_STORAGE_DTYPES[dtype_name]
+                        )
+                    )
+            host_payload = torch.cat(chunks, dim=1).to(device="cpu")
+            payload_buffers[dtype_name].index_copy_(0, host_pages, host_payload)
+
+        if layout.metadata_count:
+            host_scales = torch.stack(group_scales, dim=2).to(
+                device="cpu", dtype=KVTC_QUANT_METADATA_DTYPE
+            )
+            host_offsets = torch.stack(group_offsets, dim=2).to(
+                device="cpu", dtype=KVTC_QUANT_METADATA_DTYPE
+            )
+            scales.index_copy_(0, host_pages, host_scales)
+            offsets.index_copy_(0, host_pages, host_offsets)
+        self._log_batch("quantized", name, host_pages, layout.feature_count)
+
+    def dequantize_pages_keys(
+        self,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._dequantize_pages(
+            self._keys, "keys", host_pages, payload_buffers, scales, offsets
+        )
+
+    def dequantize_pages_values(
+        self,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._dequantize_pages(
+            self._values, "values", host_pages, payload_buffers, scales, offsets
+        )
+
+    def _dequantize_pages(
+        self,
+        side: _KVTCQuantSide | None,
+        name: str,
+        host_pages: torch.Tensor,
+        payload_buffers: dict[str, torch.Tensor],
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        side = self._require_side(side, name)
+        self._validate_host_pages(host_pages)
+        num_pages = host_pages.numel()
+        layout = side.layout
+        if num_pages > self.staging_capacity_pages:
+            raise ValueError(
+                f"KVTC {name} dequantization received {num_pages} pages; "
+                f"staging capacity is {self.staging_capacity_pages}"
+            )
+        if num_pages == 0:
+            return torch.empty(
+                (0, self.page_size, layout.feature_count),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        device_payloads = {}
+        host_page_list = host_pages.tolist()
+        for dtype_name, host_payload in payload_buffers.items():
+            staged = side.staging[dtype_name][:num_pages]
+            for dst_page, src_page in enumerate(host_page_list):
+                staged[dst_page].copy_(host_payload[src_page], non_blocking=True)
+            device_payloads[dtype_name] = staged
+
+        output = torch.empty(
+            (num_pages, self.page_size, layout.feature_count),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        for dtype_name in ("float32", "bfloat16"):
+            for group in layout.groups_by_dtype.get(dtype_name, ()):
+                payload = device_payloads[dtype_name][
+                    :, group.payload_start : group.payload_end
+                ]
+                output[:, :, group.feature_start : group.feature_end] = payload.reshape(
+                    num_pages,
+                    self.page_size,
+                    group.feature_end - group.feature_start,
+                )
+
+        if layout.metadata_count:
+            host_scales = scales.index_select(0, host_pages)
+            host_offsets = offsets.index_select(0, host_pages)
+            device_scales = host_scales.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            device_offsets = host_offsets.to(
+                device=self.device, dtype=torch.float32, non_blocking=True
+            )
+            for dtype_name, (
+                payload_indices,
+                metadata_indices,
+                feature_indices,
+            ) in side.dequant_indices.items():
+                payload = device_payloads[dtype_name].index_select(
+                    1, payload_indices
+                ).reshape(1, -1)
+                if dtype_name == "int4" and payload.storage_offset() != 0:
+                    payload = payload.clone()
+                expanded_scales = device_scales.index_select(
+                    2, metadata_indices
+                ).reshape(-1)
+                expanded_offsets = device_offsets.index_select(
+                    2, metadata_indices
+                ).reshape(-1)
+                kwargs = {"offset": expanded_offsets, "dst_dtype": self.cache_dtype}
+                if dtype_name == "int4" and hasattr(torch, "int4"):
+                    kwargs["src_dtype"] = torch.quint4x2
+                assert self._npu_ops is not None
+                dequantized = self._npu_ops.npu_anti_quant(
+                    payload, expanded_scales, **kwargs
+                )
+                output[:, :, feature_indices] = dequantized.to(
+                    dtype=output.dtype
+                ).reshape(num_pages, self.page_size, feature_indices.numel())
+
+        self._log_batch("dequantized", name, host_pages, layout.feature_count)
+        return output
+
+    def _validate_host_pages(self, host_pages: torch.Tensor) -> None:
+        if (
+            host_pages.ndim != 1
+            or host_pages.dtype != torch.int64
+            or host_pages.device.type != "cpu"
+        ):
+            raise ValueError("KVTC host page IDs must be a CPU int64 vector")
+
+    def _validate_pages(
+        self,
+        pages: torch.Tensor,
+        host_pages: torch.Tensor,
+        layout: KVTCQuantGroupedLayout,
+    ) -> None:
+        self._validate_host_pages(host_pages)
+        if (
+            pages.ndim != 3
+            or pages.shape[0] != host_pages.numel()
+            or pages.shape[1] != self.page_size
+            or pages.shape[2] < layout.feature_count
+        ):
+            raise ValueError(
+                "KVTC projected pages must have shape "
+                f"[len(host_pages), {self.page_size}, >= {layout.feature_count}]"
+            )
+
+    @staticmethod
+    def _log_batch(
+        operation: str,
+        name: str,
+        host_pages: torch.Tensor,
+        feature_count: int,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        page_sample = host_pages[:8].tolist()
+        logger.debug(
+            "KVTC %s %s pages=%d host_page_ids=%s%s retained=%d",
+            operation,
+            name,
+            host_pages.numel(),
+            page_sample,
+            "..." if host_pages.numel() > len(page_sample) else "",
+            feature_count,
+        )
