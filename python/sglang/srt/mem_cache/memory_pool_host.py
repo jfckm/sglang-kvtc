@@ -3349,7 +3349,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             logger.info("Using KVTC compression")
 
             logger.info(
-                f"KVTC calibration data loading. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                f"KVTC calibration data loading. avail mem="
+                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
             )
 
             worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
@@ -3396,7 +3397,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
             if keys_params is not None:
                 logger.info(
-                    f"NPU compressed K basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                    f"NPU compressed K basis loading begin. avail mem="
+                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
                 self.kvtc_k_mu = keys_params.mu.to(self.device_pool.device)
                 self.kvtc_k_V = keys_params.basis.to(self.device_pool.device)
@@ -3404,7 +3406,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.offload_page_shape_k = (self.page_size, self.kvtc_k_V.shape[1])
 
                 logger.info(
-                    f"NPU compressed K basis loading end. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                    f"NPU compressed K basis loading end. avail mem="
+                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
                 logger.debug(
                     f"K basis final shape {self.kvtc_k_V.shape}, offload page shape {self.offload_page_shape_k}"
@@ -3412,7 +3415,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
 
             if values_params is not None:
                 logger.info(
-                    f"NPU compressed V basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                    f"NPU compressed V basis loading begin. avail mem="
+                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
                 self.kvtc_v_mu = values_params.mu.to(self.device_pool.device)
                 self.kvtc_v_V = values_params.basis.to(self.device_pool.device)
@@ -3420,7 +3424,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 self.offload_page_shape_v = (self.page_size, self.kvtc_v_V.shape[1])
 
                 logger.info(
-                    f"NPU compressed V basis loading end. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                    f"NPU compressed V basis loading end. avail mem="
+                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
                 logger.debug(
                     f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
@@ -3441,7 +3446,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         if skip_size_check == False:
             assert (
                 self.size > device_pool.size
-            ), f"The host memory should be larger than the device memory with the current protocol ({self.size} vs {device_pool.size})"
+            ), f"The host memory should be larger than the device memory with "
+            f"the current protocol ({self.size} vs {device_pool.size})"
 
         self.init_kv_buffer()
 
@@ -3527,7 +3533,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         return payload_buffers, scales, offsets
 
     def init_kv_buffer(self):
-        logger.info(f"NPU compressed pool alloc begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
+        logger.info(f"NPU compressed pool alloc begin. avail mem="
+                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -3588,7 +3595,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 pin_memory=True,
             )
 
-        logger.info(f"NPU compressed pool alloc end(pages={self.page_num}. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
+        logger.info(f"NPU compressed pool alloc end(pages={self.page_num}. "
+                    f"avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
 
     def get_size_per_token(self):
         return self._get_page_size_bytes() / self.page_size
