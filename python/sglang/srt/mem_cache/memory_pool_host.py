@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.mem_cache.kvtc_quant import (
     KVTC_QUANT_METADATA_DTYPE,
     KVTC_QUANT_STORAGE_DTYPES,
+    KVTCArtifactLoader,
     KVTCQuantGroupedLayout as _KVTCQuantGroupedLayout,
     KVTCQuantizer,
 )
@@ -3351,39 +3352,40 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 f"KVTC calibration data loading. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
             )
 
-            kvtc_params = torch.load(kvtc_params_path, map_location="cpu")
-            self.k_kvtc = "keys" in kvtc_params and kvtc_k_compression_ratio > 0
-            self.v_kvtc = "values" in kvtc_params and kvtc_v_compression_ratio > 0
-
             worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
-            keys_params = kvtc_params["keys"].get(worker_key) if self.k_kvtc else None
-            values_params = kvtc_params["values"].get(worker_key) if self.v_kvtc else None
-            if self.k_kvtc and keys_params is None:
-                raise Exception(f"Wrong K KVTC config - missing {worker_key}")
-            if self.v_kvtc and values_params is None:
-                raise Exception(f"Wrong V KVTC config - missing {worker_key}")
+            loaded = KVTCArtifactLoader(
+                kvtc_params_path,
+                worker_key=worker_key,
+                p=p,
+                page_size=self.page_size,
+                k_cr=kvtc_k_compression_ratio,
+                v_cr=kvtc_v_compression_ratio,
+                quant_disable=self.kvtc_quant_disable,
+            )
+            keys_params = loaded.keys
+            values_params = loaded.values
+            self.k_kvtc = keys_params is not None
+            self.v_kvtc = values_params is not None
 
-            if not self.kvtc_quant_disable and (self.k_kvtc or self.v_kvtc):
+            if not self.kvtc_quant_disable and (
+                keys_params is not None or values_params is not None
+            ):
                 self.quantizer = KVTCQuantizer(
                     keys_schema=(
-                        self._load_quant_schema(
-                            keys_params, kvtc_k_compression_ratio, f"K/{worker_key}"
-                        )
-                        if self.k_kvtc
-                        else None
+                        keys_params.schema if keys_params is not None else None
                     ),
                     values_schema=(
-                        self._load_quant_schema(
-                            values_params, kvtc_v_compression_ratio, f"V/{worker_key}"
-                        )
-                        if self.v_kvtc
-                        else None
+                        values_params.schema if values_params is not None else None
                     ),
                     keys_basis_rank=(
-                        keys_params["basis"].shape[1] if self.k_kvtc else None
+                        keys_params.source_basis_rank
+                        if keys_params is not None
+                        else None
                     ),
                     values_basis_rank=(
-                        values_params["basis"].shape[1] if self.v_kvtc else None
+                        values_params.source_basis_rank
+                        if values_params is not None
+                        else None
                     ),
                     artifact_path=kvtc_params_path,
                     page_size=self.page_size,
@@ -3392,23 +3394,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     staging_capacity_pages=self._QUANT_BATCH_MAX_PAGES,
                 )
 
-            if self.k_kvtc:
+            if keys_params is not None:
                 logger.info(
                     f"NPU compressed K basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
-                if self.kvtc_quant_disable:
-                    k_dim_limit = p // int(kvtc_k_compression_ratio)
-                else:
-                    k_dim_limit = self.quantizer.key_layout().feature_count
-
-                self.kvtc_k_mu = self._copy_with_trim(keys_params["mu"])
-
-                if self.kvtc_k_mu.shape[0] != p:
-                    logger.error(f"K mu mismatch {self.kvtc_k_mu.shape} vs {p}")
-
-                self.kvtc_k_V = self._copy_with_trim(keys_params["basis"], (p, k_dim_limit))
-                if self.kvtc_k_V.shape[0] != p:
-                    logger.error(f"K V mismatch {self.kvtc_k_V.shape} vs {p}")
+                self.kvtc_k_mu = keys_params.mu.to(self.device_pool.device)
+                self.kvtc_k_V = keys_params.basis.to(self.device_pool.device)
 
                 self.offload_page_shape_k = (self.page_size, self.kvtc_k_V.shape[1])
 
@@ -3419,23 +3410,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                     f"K basis final shape {self.kvtc_k_V.shape}, offload page shape {self.offload_page_shape_k}"
                 )
 
-            if self.v_kvtc:
+            if values_params is not None:
                 logger.info(
                     f"NPU compressed V basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
                 )
-                if self.kvtc_quant_disable:
-                    v_dim_limit = p // int(kvtc_v_compression_ratio)
-                else:
-                    v_dim_limit = self.quantizer.value_layout().feature_count
-
-                self.kvtc_v_mu = self._copy_with_trim(values_params["mu"])
-
-                if self.kvtc_v_mu.shape[0] != p:
-                    logger.error(f"V mu mismatch {self.kvtc_v_mu.shape} vs {p}")
-
-                self.kvtc_v_V = self._copy_with_trim(values_params["basis"], (p, v_dim_limit))
-                if self.kvtc_v_V.shape[0] != p:
-                    logger.error(f"V V mismatch {self.kvtc_v_V.shape} vs {p}")
+                self.kvtc_v_mu = values_params.mu.to(self.device_pool.device)
+                self.kvtc_v_V = values_params.basis.to(self.device_pool.device)
 
                 self.offload_page_shape_v = (self.page_size, self.kvtc_v_V.shape[1])
 
@@ -3468,25 +3448,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
-
-    @staticmethod
-    def _load_quant_schema(
-        matrix_params: dict,
-        compression_ratio: float,
-        matrix_name: str,
-    ) -> object:
-        ratio = float(compression_ratio)
-        if ratio <= 0 or not ratio.is_integer():
-            raise ValueError(
-                f"{matrix_name} KVTC compression ratio must be a positive integer, got {compression_ratio}"
-            )
-        quant_configs = matrix_params.get("quant")
-        ratio_key = str(int(ratio))
-        if not isinstance(quant_configs, dict) or ratio_key not in quant_configs:
-            raise ValueError(
-                f"{matrix_name} KVTC config is missing quantization schema quant[{ratio_key!r}]"
-            )
-        return quant_configs[ratio_key]
 
     def _get_matrix_page_size_bytes(
         self,
@@ -3544,12 +3505,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             baseline_bytes / k_bytes,
             baseline_bytes / v_bytes,
         )
-
-    def _copy_with_trim(self, in_tensor: torch.Tensor, out_shape=None) -> torch.Tensor:
-        out_shape = out_shape or in_tensor.shape
-        out_slices = tuple(slice(0, x) for x in out_shape)
-
-        return in_tensor[out_slices].to(self.device_pool.device)
 
     def _allocate_quant_buffers(self, layout: _KVTCQuantGroupedLayout):
         payload_buffers = {
