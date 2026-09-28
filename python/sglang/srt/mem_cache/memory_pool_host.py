@@ -3346,92 +3346,12 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         p = self.layer_num * self.head_num * self.head_dim
 
         if kvtc_params_path:
-            logger.info("Using KVTC compression")
-
-            logger.info(
-                f"KVTC calibration data loading. avail mem="
-                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
-            )
-
-            worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
-            loader = KVTCArtifactLoader(
+            self._init_kvtc(
                 kvtc_params_path,
-                worker_key=worker_key,
-                p=p,
-                page_size=self.page_size,
-                k_cr=kvtc_k_compression_ratio,
-                v_cr=kvtc_v_compression_ratio,
-                quant_disable=self.kvtc_quant_disable,
+                kvtc_k_compression_ratio,
+                kvtc_v_compression_ratio,
+                p,
             )
-            keys_params = loader.keys
-            values_params = loader.values
-            self.k_kvtc = keys_params is not None
-            self.v_kvtc = values_params is not None
-
-            if not self.kvtc_quant_disable and (
-                keys_params is not None or values_params is not None
-            ):
-                self.quantizer = KVTCQuantizer(
-                    keys_schema=(
-                        keys_params.schema if keys_params is not None else None
-                    ),
-                    values_schema=(
-                        values_params.schema if values_params is not None else None
-                    ),
-                    keys_basis_rank=(
-                        keys_params.source_basis_rank
-                        if keys_params is not None
-                        else None
-                    ),
-                    values_basis_rank=(
-                        values_params.source_basis_rank
-                        if values_params is not None
-                        else None
-                    ),
-                    artifact_path=kvtc_params_path,
-                    page_size=self.page_size,
-                    device=self.device_pool.device,
-                    cache_dtype=self.dtype,
-                    staging_capacity_pages=self._QUANT_BATCH_MAX_PAGES,
-                )
-
-            if keys_params is not None:
-                logger.info(
-                    f"NPU compressed K basis loading begin. avail mem="
-                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
-                )
-                self.kvtc_k_mu = keys_params.mu.to(self.device_pool.device)
-                self.kvtc_k_V = keys_params.basis.to(self.device_pool.device)
-
-                self.offload_page_shape_k = (self.page_size, self.kvtc_k_V.shape[1])
-
-                logger.info(
-                    f"NPU compressed K basis loading end. avail mem="
-                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
-                )
-                logger.debug(
-                    f"K basis final shape {self.kvtc_k_V.shape}, offload page shape {self.offload_page_shape_k}"
-                )
-
-            if values_params is not None:
-                logger.info(
-                    f"NPU compressed V basis loading begin. avail mem="
-                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
-                )
-                self.kvtc_v_mu = values_params.mu.to(self.device_pool.device)
-                self.kvtc_v_V = values_params.basis.to(self.device_pool.device)
-
-                self.offload_page_shape_v = (self.page_size, self.kvtc_v_V.shape[1])
-
-                logger.info(
-                    f"NPU compressed V basis loading end. avail mem="
-                    f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
-                )
-                logger.debug(
-                    f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
-                )
-
-            torch_npu.npu.synchronize()
 
         self.page_size_bytes = self._get_page_size_bytes()
         self.size_per_token = self.page_size_bytes / self.page_size
@@ -3454,6 +3374,98 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def _init_kvtc(
+        self,
+        kvtc_params_path: str,
+        kvtc_k_compression_ratio: float,
+        kvtc_v_compression_ratio: float,
+        p: int,
+    ) -> None:
+        logger.info("Using KVTC compression")
+
+        logger.info(
+            f"KVTC calibration data loading. avail mem="
+            f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+        )
+
+        worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
+        loader = KVTCArtifactLoader(
+            kvtc_params_path,
+            worker_key=worker_key,
+            p=p,
+            page_size=self.page_size,
+            k_cr=kvtc_k_compression_ratio,
+            v_cr=kvtc_v_compression_ratio,
+            quant_disable=self.kvtc_quant_disable,
+        )
+        keys_params = loader.keys
+        values_params = loader.values
+        self.k_kvtc = keys_params is not None
+        self.v_kvtc = values_params is not None
+
+        if not self.kvtc_quant_disable and (
+            keys_params is not None or values_params is not None
+        ):
+            self.quantizer = KVTCQuantizer(
+                keys_schema=(
+                    keys_params.schema if keys_params is not None else None
+                ),
+                values_schema=(
+                    values_params.schema if values_params is not None else None
+                ),
+                keys_basis_rank=(
+                    keys_params.source_basis_rank if keys_params is not None else None
+                ),
+                values_basis_rank=(
+                    values_params.source_basis_rank
+                    if values_params is not None
+                    else None
+                ),
+                artifact_path=kvtc_params_path,
+                page_size=self.page_size,
+                device=self.device_pool.device,
+                cache_dtype=self.dtype,
+                staging_capacity_pages=self._QUANT_BATCH_MAX_PAGES,
+            )
+
+        if keys_params is not None:
+            logger.info(
+                f"NPU compressed K basis loading begin. avail mem="
+                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+            )
+            self.kvtc_k_mu = keys_params.mu.to(self.device_pool.device)
+            self.kvtc_k_V = keys_params.basis.to(self.device_pool.device)
+
+            self.offload_page_shape_k = (self.page_size, self.kvtc_k_V.shape[1])
+
+            logger.info(
+                f"NPU compressed K basis loading end. avail mem="
+                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+            )
+            logger.debug(
+                f"K basis final shape {self.kvtc_k_V.shape}, offload page shape {self.offload_page_shape_k}"
+            )
+
+        if values_params is not None:
+            logger.info(
+                f"NPU compressed V basis loading begin. avail mem="
+                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+            )
+            self.kvtc_v_mu = values_params.mu.to(self.device_pool.device)
+            self.kvtc_v_V = values_params.basis.to(self.device_pool.device)
+
+            self.offload_page_shape_v = (self.page_size, self.kvtc_v_V.shape[1])
+
+            logger.info(
+                f"NPU compressed V basis loading end. avail mem="
+                f"{get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+            )
+            logger.debug(
+                f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
+            )
+
+        torch_npu.npu.synchronize()
 
     def _get_matrix_page_size_bytes(
         self,
