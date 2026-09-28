@@ -3354,7 +3354,7 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             )
 
             worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
-            loaded = KVTCArtifactLoader(
+            loader = KVTCArtifactLoader(
                 kvtc_params_path,
                 worker_key=worker_key,
                 p=p,
@@ -3363,8 +3363,8 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 v_cr=kvtc_v_compression_ratio,
                 quant_disable=self.kvtc_quant_disable,
             )
-            keys_params = loaded.keys
-            values_params = loaded.values
+            keys_params = loader.keys
+            values_params = loader.values
             self.k_kvtc = keys_params is not None
             self.v_kvtc = values_params is not None
 
