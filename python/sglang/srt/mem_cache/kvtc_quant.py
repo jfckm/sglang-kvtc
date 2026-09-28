@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import Path
 
 import torch
 
 
 logger = logging.getLogger(__name__)
+
+
+KVTC_FILE_VERSION = "v3-worker-quant"
 
 
 KVTC_QUANT_STORAGE_DTYPES = {
@@ -55,6 +60,14 @@ class KVTCQuantGroupedLayout:
             )
             for groups in groups_by_dtype.values()
         )
+
+
+@dataclass(frozen=True)
+class KVTCLoadedSide:
+    mu: torch.Tensor
+    basis: torch.Tensor
+    schema: object | None
+    source_basis_rank: int
 
 
 def quant_group_bits(group_size: int, dtype_name: str) -> int:
@@ -614,3 +627,156 @@ class KVTCQuantizer:
 # Calibration still imports this name; keep it as an alias, without a second
 # implementation of schema validation or feature counting.
 build_quant_layout = KVTCQuantizer.build_layout
+
+
+class KVTCArtifactLoader:
+    """Load and validate one worker's K/V calibration data on the CPU."""
+
+    def __init__(
+        self,
+        artifact_path: str | Path,
+        *,
+        worker_key: str,
+        p: int,
+        page_size: int,
+        k_cr: int | float,
+        v_cr: int | float,
+        quant_disable: bool,
+    ) -> None:
+        if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
+            raise ValueError(
+                f"KVTC feature count p must be a positive integer, got {p!r}"
+            )
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size <= 0
+        ):
+            raise ValueError(
+                f"KVTC page size must be a positive integer, got {page_size!r}"
+            )
+        if not isinstance(worker_key, str) or not worker_key:
+            raise ValueError(
+                f"KVTC worker key must be a non-empty string, got {worker_key!r}"
+            )
+
+        k_ratio = self._validate_ratio(k_cr, "K")
+        v_ratio = self._validate_ratio(v_cr, "V")
+        path = Path(artifact_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"KVTC artifact does not exist: {path}")
+        artifact = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(artifact, dict):
+            raise ValueError(f"KVTC artifact must contain a dictionary: {path}")
+        if artifact.get("version") != KVTC_FILE_VERSION:
+            raise ValueError(
+                f"KVTC artifact version mismatch in {path}: expected "
+                f"{KVTC_FILE_VERSION!r}, found {artifact.get('version', '<missing>')!r}"
+            )
+
+        self.keys = self._load_side(
+            artifact, "keys", "K", worker_key, p, page_size, k_ratio, quant_disable
+        )
+        self.values = self._load_side(
+            artifact, "values", "V", worker_key, p, page_size, v_ratio, quant_disable
+        )
+
+    @staticmethod
+    def _validate_ratio(ratio: int | float, side: str) -> int:
+        if (
+            isinstance(ratio, bool)
+            or not isinstance(ratio, (int, float))
+            or ratio < 0
+            or (
+                isinstance(ratio, float)
+                and (not math.isfinite(ratio) or not ratio.is_integer())
+            )
+        ):
+            raise ValueError(
+                f"{side} KVTC compression ratio must be a nonnegative integer, "
+                f"got {ratio!r}"
+            )
+        return int(ratio)
+
+    @staticmethod
+    def _load_side(
+        artifact: dict,
+        entry_name: str,
+        side: str,
+        worker_key: str,
+        p: int,
+        page_size: int,
+        ratio: int,
+        quant_disable: bool,
+    ) -> KVTCLoadedSide | None:
+        if ratio == 0:
+            return None
+
+        workers = artifact.get(entry_name)
+        if not isinstance(workers, dict) or worker_key not in workers:
+            raise ValueError(f"KVTC artifact is missing {entry_name}/{worker_key}")
+        params = workers[worker_key]
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"KVTC artifact {entry_name}/{worker_key} must be a dictionary"
+            )
+
+        mu = params.get("mu")
+        basis = params.get("basis")
+        context = f"{side}/{worker_key}"
+        if (
+            not isinstance(mu, torch.Tensor)
+            or mu.dtype != torch.float32
+            or mu.shape != (p,)
+        ):
+            raise ValueError(
+                f"KVTC artifact {context}/mu must be an FP32 tensor of shape [{p}]"
+            )
+        if (
+            not isinstance(basis, torch.Tensor)
+            or basis.dtype != torch.float32
+            or basis.ndim != 2
+            or basis.shape[0] != p
+            or basis.shape[1] == 0
+        ):
+            raise ValueError(
+                f"KVTC artifact {context}/basis must be an FP32 tensor "
+                f"of shape [{p}, rank>0]"
+            )
+
+        basis_rank = basis.shape[1]
+        if quant_disable:
+            schema = None
+            retained_rank = p // ratio
+            if retained_rank == 0:
+                raise ValueError(
+                    f"KVTC artifact {context} compression ratio {ratio} "
+                    "retains no features"
+                )
+        else:
+            quant = params.get("quant")
+            ratio_key = str(ratio)
+            if not isinstance(quant, dict) or ratio_key not in quant:
+                raise ValueError(
+                    f"KVTC artifact {context} is missing quantization schema "
+                    f"quant[{ratio_key!r}]"
+                )
+            schema = quant[ratio_key]
+            retained_rank = KVTCQuantizer.build_layout(
+                schema,
+                page_size=page_size,
+                basis_rank=basis_rank,
+                matrix_name=context,
+            ).feature_count
+        if retained_rank > basis_rank:
+            raise ValueError(
+                f"KVTC artifact {context} basis rank {basis_rank} is shorter than "
+                f"the retained rank {retained_rank}"
+            )
+
+        return KVTCLoadedSide(
+            mu=mu,
+            basis=basis[:, :retained_rank],
+            schema=schema,
+            source_basis_rank=basis_rank,
+        )
