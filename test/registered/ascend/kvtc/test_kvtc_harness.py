@@ -98,7 +98,7 @@ class FixtureFactory:
 
         from scripts.kvtc_calibration_data import Rope
         from sglang.srt.distributed.utils import get_pp_indices
-        from sglang.srt.mem_cache.kvtc_quant import build_quant_layout
+        from sglang.srt.mem_cache.kvtc_quant import KVTCQuantizer
         from sglang.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
@@ -209,7 +209,7 @@ class FixtureFactory:
                     raise ValueError(
                         f"Artifact {side}/{worker_name} has no quant schemas"
                     )
-                build_quant_layout(
+                KVTCQuantizer.build_layout(
                     quant.get(str(ratio)),
                     page_size=page_size,
                     basis_rank=basis.shape[1],

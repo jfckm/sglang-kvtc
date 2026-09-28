@@ -37,14 +37,6 @@ class KVTCQuantGroup:
 
 
 @dataclass(frozen=True)
-class KVTCQuantLayout:
-    groups: tuple[KVTCQuantGroup, ...]
-    feature_count: int
-    payload_elements: dict[str, int]
-    metadata_count: int
-
-
-@dataclass(frozen=True)
 class KVTCQuantGroupedLayout:
     direct_storage_groups: dict[str, tuple[KVTCQuantGroup, ...]]
     integer_quant_groups: dict[str, tuple[KVTCQuantGroup, ...]]
@@ -53,6 +45,17 @@ class KVTCQuantGroupedLayout:
     metadata_count: int
     bytes_per_token: int
 
+    @property
+    def group_count(self) -> int:
+        return sum(
+            len(groups)
+            for groups_by_dtype in (
+                self.direct_storage_groups,
+                self.integer_quant_groups,
+            )
+            for groups in groups_by_dtype.values()
+        )
+
 
 def quant_group_bits(group_size: int, dtype_name: str) -> int:
     """Return per-token storage, including one FP16 scale/offset pair."""
@@ -60,81 +63,6 @@ def quant_group_bits(group_size: int, dtype_name: str) -> int:
     if dtype_name in KVTC_QUANTIZED_DTYPES:
         bits += 2 * KVTC_QUANT_METADATA_DTYPE.itemsize * 8
     return bits
-
-
-def build_quant_layout(
-    schema: object,
-    *,
-    page_size: int,
-    basis_rank: int,
-    matrix_name: str,
-) -> KVTCQuantLayout:
-    if not isinstance(schema, (list, tuple)) or not schema:
-        raise ValueError(
-            f"{matrix_name} KVTC quantization schema must be a non-empty list"
-        )
-
-    groups = []
-    feature_offset = 0
-    metadata_count = 0
-    payload_offsets = {name: 0 for name in KVTC_QUANT_STORAGE_DTYPES}
-    for group_index, entry in enumerate(schema):
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization entry {group_index} must be (group_size, dtype)"
-            )
-
-        group_size, dtype_name = entry
-        if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size <= 0:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization group {group_index} has invalid size {group_size!r}"
-            )
-        if dtype_name not in KVTC_QUANT_STORAGE_DTYPES:
-            raise ValueError(
-                f"{matrix_name} KVTC quantization group {group_index} has unsupported dtype {dtype_name!r}"
-            )
-        if dtype_name == "int4":
-            if group_size < 8 or group_size % 8 != 0:
-                raise ValueError(
-                    f"{matrix_name} KVTC int4 group {group_index} has size {group_size}; "
-                    "packed int4 requires a group size of at least 8 and a multiple of 8"
-                )
-            payload_elements = page_size * group_size // 8
-        else:
-            payload_elements = page_size * group_size
-
-        metadata_index = None
-        if dtype_name in KVTC_QUANTIZED_DTYPES:
-            metadata_index = metadata_count
-            metadata_count += 1
-
-        payload_start = payload_offsets[dtype_name]
-        payload_end = payload_start + payload_elements
-        groups.append(
-            KVTCQuantGroup(
-                feature_start=feature_offset,
-                feature_end=feature_offset + group_size,
-                dtype_name=dtype_name,
-                payload_start=payload_start,
-                payload_end=payload_end,
-                metadata_index=metadata_index,
-            )
-        )
-        feature_offset += group_size
-        payload_offsets[dtype_name] = payload_end
-
-    if feature_offset > basis_rank:
-        raise ValueError(
-            f"{matrix_name} KVTC quantization schema retains {feature_offset} features, "
-            f"but basis rank is only {basis_rank}"
-        )
-
-    return KVTCQuantLayout(
-        groups=tuple(groups),
-        feature_count=feature_offset,
-        payload_elements={name: count for name, count in payload_offsets.items() if count},
-        metadata_count=metadata_count,
-    )
 
 
 @dataclass(frozen=True)
@@ -223,10 +151,11 @@ class KVTCQuantizer:
                     layout,
                 )
 
-    def _build_quant_layout(
-        self, schema: object, *, basis_rank: int, matrix_name: str
+    @staticmethod
+    def build_layout(
+        schema: object, *, page_size: int, basis_rank: int, matrix_name: str
     ) -> KVTCQuantGroupedLayout:
-        """Group storage by dtype while preserving PCA feature ranges."""
+        """Validate a schema and group storage by dtype without allocating buffers."""
         if not isinstance(schema, (list, tuple)) or not schema:
             raise ValueError(
                 f"{matrix_name} KVTC quantization schema must be a non-empty list"
@@ -276,9 +205,9 @@ class KVTCQuantizer:
                         "packed int4 requires a group size of at least 8 "
                         "and a multiple of 8"
                     )
-                payload_elements = self.page_size * group_size // 8
+                payload_elements = page_size * group_size // 8
             else:
-                payload_elements = self.page_size * group_size
+                payload_elements = page_size * group_size
 
             metadata_index = None
             if dtype_name in KVTC_QUANTIZED_DTYPES:
@@ -369,8 +298,8 @@ class KVTCQuantizer:
             return None
         if basis_rank is None:
             raise ValueError(f"KVTC {name} schema requires a basis rank")
-        layout = self._build_quant_layout(
-            schema, basis_rank=basis_rank, matrix_name=name
+        layout = self.build_layout(
+            schema, page_size=self.page_size, basis_rank=basis_rank, matrix_name=name
         )
         if layout.metadata_count:
             self._ensure_npu_ops()
@@ -680,3 +609,8 @@ class KVTCQuantizer:
             "..." if host_pages.numel() > len(page_sample) else "",
             feature_count,
         )
+
+
+# Calibration still imports this name; keep it as an alias, without a second
+# implementation of schema validation or feature counting.
+build_quant_layout = KVTCQuantizer.build_layout

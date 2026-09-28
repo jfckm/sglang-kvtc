@@ -362,7 +362,7 @@ def resolve_ratio(params, requested, option):
 def describe_modes(args, shape, dtype, report=print):
     import torch
 
-    from sglang.srt.mem_cache.kvtc_quant import build_quant_layout, quant_group_bits
+    from sglang.srt.mem_cache.kvtc_quant import KVTCQuantizer, quant_group_bits
 
     _, layers, heads, head_dim = shape
     features = layers * heads * head_dim
@@ -407,12 +407,12 @@ def describe_modes(args, shape, dtype, report=print):
                 page_bytes += args.page_size * rank * dtype.itemsize
             else:
                 schema = entry.get("quant", {}).get(str(ratio))
-                layout = build_quant_layout(
+                layout = KVTCQuantizer.build_layout(
                     schema, page_size=args.page_size,
                     basis_rank=entry["basis"].shape[1], matrix_name=side,
                 )
                 ranks.append(layout.feature_count)
-                groups.append(len(layout.groups))
+                groups.append(layout.group_count)
                 page_bytes += args.page_size * sum(
                     quant_group_bits(size, storage) for size, storage in schema
                 ) // 8

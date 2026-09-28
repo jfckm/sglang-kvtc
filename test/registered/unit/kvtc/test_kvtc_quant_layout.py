@@ -17,6 +17,11 @@ QUANT = runpy.run_path(
 
 
 class TestKVTCQuantGroupedLayout(unittest.TestCase):
+    def test_calibration_import_uses_runtime_builder(self):
+        self.assertIs(
+            QUANT["build_quant_layout"], QUANT["KVTCQuantizer"].build_layout
+        )
+
     def build_new(self, schema, *, page_size, basis_rank):
         npu_ops = types.ModuleType("torch_npu")
         npu_ops.npu_dynamic_quant_asymmetric = Mock()
@@ -37,7 +42,7 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
 
     def build_both(self, schema, *, page_size=128, basis_rank=64):
         return (
-            QUANT["build_quant_layout"](
+            QUANT["KVTCQuantizer"].build_layout(
                 schema, page_size=page_size, basis_rank=basis_rank, matrix_name="keys"
             ),
             self.build_new(schema, page_size=page_size, basis_rank=basis_rank),
@@ -52,16 +57,17 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
             (2, "bfloat16"),
             (4, "int8"),
         ]
-        old, new = self.build_both(schema)
+        layout, runtime_layout = self.build_both(schema)
 
-        self.assertEqual(list(new.direct_storage_groups), ["float32", "bfloat16"])
-        self.assertEqual(list(new.integer_quant_groups), ["int8", "int4"])
+        self.assertEqual(layout, runtime_layout)
+        self.assertEqual(list(layout.direct_storage_groups), ["float32", "bfloat16"])
+        self.assertEqual(list(layout.integer_quant_groups), ["int8", "int4"])
         self.assertEqual(
             {
                 dtype: [group.feature_start for group in groups]
                 for groups_by_dtype in (
-                    new.direct_storage_groups,
-                    new.integer_quant_groups,
+                    layout.direct_storage_groups,
+                    layout.integer_quant_groups,
                 )
                 for dtype, groups in groups_by_dtype.items()
             },
@@ -72,57 +78,68 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
                 "int4": [3, 16],
             },
         )
-        self.assertEqual(new.feature_count, 38)
-        self.assertEqual(new.metadata_count, 4)
+        self.assertEqual(layout.feature_count, 38)
+        self.assertEqual(layout.metadata_count, 4)
         self.assertEqual(
-            new.payload_elements,
+            layout.payload_elements,
             {"float32": 384, "bfloat16": 256, "int8": 1152, "int4": 384},
         )
-        self.assertEqual(new.feature_count, old.feature_count)
-        self.assertEqual(new.metadata_count, old.metadata_count)
-        self.assertEqual(new.payload_elements, old.payload_elements)
-        self.assertEqual(new.bytes_per_token, 53)
+        self.assertEqual(layout.bytes_per_token, 53)
+        self.assertEqual(layout.group_count, len(schema))
         self.assertEqual(
             sorted(
                 (
                     group
                     for groups_by_dtype in (
-                        new.direct_storage_groups,
-                        new.integer_quant_groups,
+                        layout.direct_storage_groups,
+                        layout.integer_quant_groups,
                     )
                     for groups in groups_by_dtype.values()
                     for group in groups
                 ),
                 key=lambda group: group.feature_start,
             ),
-            list(old.groups),
+            [
+                QUANT["KVTCQuantGroup"](0, 3, "float32", 0, 384, None),
+                QUANT["KVTCQuantGroup"](3, 11, "int4", 0, 128, 0),
+                QUANT["KVTCQuantGroup"](11, 16, "int8", 0, 640, 1),
+                QUANT["KVTCQuantGroup"](16, 32, "int4", 128, 384, 2),
+                QUANT["KVTCQuantGroup"](32, 34, "bfloat16", 0, 256, None),
+                QUANT["KVTCQuantGroup"](34, 38, "int8", 640, 1152, 3),
+            ],
         )
 
     def test_single_dtype_keeps_separate_groups(self):
-        old, new = self.build_both([(5, "int8"), (7, "int8")], page_size=2)
-        self.assertEqual(new.direct_storage_groups, {})
-        self.assertEqual(list(new.integer_quant_groups), ["int8"])
-        self.assertEqual(new.integer_quant_groups["int8"], old.groups)
-        self.assertEqual(new.payload_elements, {"int8": 24})
-        self.assertEqual(new.metadata_count, 2)
-        self.assertEqual(new.bytes_per_token, 20)
+        layout, runtime_layout = self.build_both(
+            [(5, "int8"), (7, "int8")], page_size=2
+        )
+        self.assertEqual(layout, runtime_layout)
+        self.assertEqual(layout.direct_storage_groups, {})
+        self.assertEqual(list(layout.integer_quant_groups), ["int8"])
+        self.assertEqual(len(layout.integer_quant_groups["int8"]), 2)
+        self.assertEqual(layout.payload_elements, {"int8": 24})
+        self.assertEqual(layout.metadata_count, 2)
+        self.assertEqual(layout.bytes_per_token, 20)
 
     def test_float_groups_need_no_metadata(self):
-        old, new = self.build_both([(3, "bfloat16"), (2, "float32")])
-        self.assertEqual(new.metadata_count, 0)
-        self.assertEqual(new.integer_quant_groups, {})
+        layout, runtime_layout = self.build_both([(3, "bfloat16"), (2, "float32")])
+        self.assertEqual(layout, runtime_layout)
+        self.assertEqual(layout.metadata_count, 0)
+        self.assertEqual(layout.integer_quant_groups, {})
         self.assertEqual(
             [
                 group.metadata_index
-                for groups in new.direct_storage_groups.values()
+                for groups in layout.direct_storage_groups.values()
                 for group in groups
             ],
             [None, None],
         )
-        self.assertEqual(new.payload_elements, old.payload_elements)
-        self.assertEqual(new.bytes_per_token, 14)
+        self.assertEqual(
+            layout.payload_elements, {"bfloat16": 384, "float32": 256}
+        )
+        self.assertEqual(layout.bytes_per_token, 14)
 
-    def test_validation_matches_existing_builder(self):
+    def test_validation_matches_runtime_quantizer(self):
         invalid = [
             ([], 64),
             ([(3, "float32", "extra")], 64),
@@ -135,16 +152,16 @@ class TestKVTCQuantGroupedLayout(unittest.TestCase):
         ]
         for schema, basis_rank in invalid:
             with self.subTest(schema=schema, basis_rank=basis_rank):
-                with self.assertRaises(ValueError) as old_error:
-                    QUANT["build_quant_layout"](
+                with self.assertRaises(ValueError) as layout_error:
+                    QUANT["KVTCQuantizer"].build_layout(
                         schema,
                         page_size=128,
                         basis_rank=basis_rank,
                         matrix_name="keys",
                     )
-                with self.assertRaises(ValueError) as new_error:
+                with self.assertRaises(ValueError) as runtime_error:
                     self.build_new(schema, page_size=128, basis_rank=basis_rank)
-                self.assertEqual(str(old_error.exception), str(new_error.exception))
+                self.assertEqual(str(layout_error.exception), str(runtime_error.exception))
 
 
 if __name__ == "__main__":
