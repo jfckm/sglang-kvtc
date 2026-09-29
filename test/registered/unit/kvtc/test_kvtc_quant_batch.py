@@ -72,6 +72,13 @@ class TestKVTCQuantBatch(unittest.TestCase):
 
     def test_backup_dispatches_ordered_batches_and_host_buffers(self):
         pool = self.make_pool()
+        quantize_order = []
+        pool.quantizer.quantize_pages_keys.side_effect = (
+            lambda _, host_pages, *args: quantize_order.append(("k", host_pages.tolist()))
+        )
+        pool.quantizer.quantize_pages_values.side_effect = (
+            lambda _, host_pages, *args: quantize_order.append(("v", host_pages.tolist()))
+        )
         device = SimpleNamespace(
             device="cpu",
             k_buffer=torch.randn(1, 5, 2, 1, 4),
@@ -99,6 +106,99 @@ class TestKVTCQuantBatch(unittest.TestCase):
                 self.assertIs(call.args[2], getattr(pool, f"{side}_quant_buffers"))
                 self.assertIs(call.args[3], getattr(pool, f"{side}_quant_scales"))
                 self.assertIs(call.args[4], getattr(pool, f"{side}_quant_offsets"))
+        self.assertEqual(
+            quantize_order,
+            [("k", [5, 1]), ("v", [5, 1]), ("k", [3]), ("v", [3])],
+        )
+
+    def test_backup_raw_pages_preserve_order(self):
+        pool = self.make_pool()
+        pool.k_kvtc = pool.v_kvtc = False
+        pool.k_buffer = torch.full((2, 8, 2, 1, 4), float("nan"))
+        pool.v_buffer = torch.full((2, 8, 2, 1, 4), float("nan"))
+        device = SimpleNamespace(
+            device="cpu",
+            k_buffer=torch.arange(2 * 5 * 2 * 4).reshape(2, 5, 2, 1, 4).float(),
+            v_buffer=torch.arange(2 * 5 * 2 * 4).reshape(2, 5, 2, 1, 4).float()
+            + 1000,
+        )
+        host_pages = torch.tensor([5, 1, 3])
+        device_pages = torch.tensor([2, 4, 0])
+
+        pool.backup_from_device_all_layer(
+            device,
+            self.page_indices(host_pages),
+            self.page_indices(device_pages),
+            list(range(6)),
+            "direct",
+        )
+
+        torch.testing.assert_close(
+            pool.k_buffer.index_select(1, host_pages),
+            device.k_buffer.index_select(1, device_pages),
+        )
+        torch.testing.assert_close(
+            pool.v_buffer.index_select(1, host_pages),
+            device.v_buffer.index_select(1, device_pages),
+        )
+        self.assertTrue(torch.isnan(pool.k_buffer[:, 0]).all())
+        pool.rotary_emb.invert_native_keys_batch.assert_not_called()
+        pool.quantizer.quantize_pages_keys.assert_not_called()
+        pool.quantizer.quantize_pages_values.assert_not_called()
+
+    def test_backup_pca_only_projects_unrotated_keys(self):
+        pool = self.make_pool()
+        pool.kvtc_quant_disable = True
+        pool.kvtc_k_mu = torch.tensor([10.0, 20.0, 30.0, 40.0])
+        pool.kvtc_v_mu = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        pool.kvtc_k_V = pool.kvtc_k_V[:, :2]
+        pool.kvtc_v_V = pool.kvtc_v_V[:, :2]
+        pool.k_buffer = torch.full((8, 2, 2), float("nan"))
+        pool.v_buffer = torch.full((8, 2, 2), float("nan"))
+        pool.rotary_emb.invert_native_keys_batch.side_effect = (
+            lambda positions, values: values - positions.reshape(-1, 1, 1, 1)
+        )
+        device = SimpleNamespace(
+            device="cpu",
+            k_buffer=torch.arange(5 * 2 * 4).reshape(1, 5, 2, 1, 4).float(),
+            v_buffer=torch.arange(5 * 2 * 4).reshape(1, 5, 2, 1, 4).float()
+            + 100,
+        )
+        host_pages = torch.tensor([5, 1, 3])
+        device_pages = torch.tensor([2, 4, 0])
+        positions = [10, 11, 30, 31, 50, 51]
+
+        pool.backup_from_device_all_layer(
+            device,
+            self.page_indices(host_pages),
+            self.page_indices(device_pages),
+            positions,
+            "direct",
+        )
+
+        source_k = (
+            device.k_buffer.index_select(1, device_pages)
+            .permute(1, 2, 0, 3, 4)
+            .reshape(3, 2, 4)
+        )
+        source_v = (
+            device.v_buffer.index_select(1, device_pages)
+            .permute(1, 2, 0, 3, 4)
+            .reshape(3, 2, 4)
+        )
+        expected_k = (
+            source_k - torch.tensor(positions).reshape(3, 2, 1) - pool.kvtc_k_mu
+        )[:, :, :2]
+        expected_v = (source_v - pool.kvtc_v_mu)[:, :, :2]
+        torch.testing.assert_close(
+            pool.k_buffer.index_select(0, host_pages), expected_k
+        )
+        torch.testing.assert_close(
+            pool.v_buffer.index_select(0, host_pages), expected_v
+        )
+        self.assertEqual(pool.rotary_emb.invert_native_keys_batch.call_count, 3)
+        pool.quantizer.quantize_pages_keys.assert_not_called()
+        pool.quantizer.quantize_pages_values.assert_not_called()
 
     def test_reload_dispatches_ordered_batches(self):
         pool = self.make_pool()

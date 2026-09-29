@@ -3801,36 +3801,15 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             device_page = device_indices[page * self.page_size] // self.page_size
             page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
 
-            if self.k_kvtc:
-                X_k = device_pool.k_buffer[:, device_page, ...].transpose(1, 0)
-                X_k_unrotated = self.rotary_emb.invert_native_keys_batch(page_token_indices, X_k)
-                D_k = torch.matmul(
-                    (X_k_unrotated.reshape(self.page_size, -1) - self.kvtc_k_mu), self.kvtc_k_V
-                )
-                if self.kvtc_quant_disable:
-                    self.k_buffer[host_page] = D_k.to(device=self.device)
-                else:
-                    projected_k_pages.append(D_k)
-            else:
-                self.k_buffer[:, host_page, ...] = device_pool.k_buffer[:, device_page, ...].to(
-                    device=self.device
-                )
+            D_k = self._backup_k_page(
+                device_pool, host_page, device_page, page_token_indices
+            )
+            if D_k is not None:
+                projected_k_pages.append(D_k)
 
-            if self.v_kvtc:
-                X_v = (
-                    device_pool.v_buffer[:, device_page, ...]
-                    .transpose(1, 0)
-                    .reshape(self.page_size, -1)
-                )
-                D_v = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V)
-                if self.kvtc_quant_disable:
-                    self.v_buffer[host_page] = D_v.to(device=self.device)
-                else:
-                    projected_v_pages.append(D_v)
-            else:
-                self.v_buffer[:, host_page, ...] = device_pool.v_buffer[:, device_page, ...].to(
-                    device=self.device
-                )
+            D_v = self._backup_v_page(device_pool, host_page, device_page)
+            if D_v is not None:
+                projected_v_pages.append(D_v)
 
             if (projected_k_pages or projected_v_pages) and (
                 page + 1 - batch_start == self._QUANT_BATCH_MAX_PAGES
@@ -3862,6 +3841,52 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                         self.v_quant_offsets,
                     )
                 batch_start = page + 1
+
+    def _backup_k_page(
+        self,
+        device_pool,
+        host_page,
+        device_page,
+        page_token_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not self.k_kvtc:
+            self.k_buffer[:, host_page, ...] = device_pool.k_buffer[
+                :, device_page, ...
+            ].to(device=self.device)
+            return None
+
+        X_k = device_pool.k_buffer[:, device_page, ...].transpose(1, 0)
+        X_k_unrotated = self.rotary_emb.invert_native_keys_batch(
+            page_token_indices, X_k
+        )
+        D_k = torch.matmul(
+            (X_k_unrotated.reshape(self.page_size, -1) - self.kvtc_k_mu),
+            self.kvtc_k_V,
+        )
+        if self.kvtc_quant_disable:
+            self.k_buffer[host_page] = D_k.to(device=self.device)
+            return None
+        return D_k
+
+    def _backup_v_page(
+        self, device_pool, host_page, device_page
+    ) -> Optional[torch.Tensor]:
+        if not self.v_kvtc:
+            self.v_buffer[:, host_page, ...] = device_pool.v_buffer[
+                :, device_page, ...
+            ].to(device=self.device)
+            return None
+
+        X_v = (
+            device_pool.v_buffer[:, device_page, ...]
+            .transpose(1, 0)
+            .reshape(self.page_size, -1)
+        )
+        D_v = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V)
+        if self.kvtc_quant_disable:
+            self.v_buffer[host_page] = D_v.to(device=self.device)
+            return None
+        return D_v
 
     def _backup_quantized_batch(
         self,
