@@ -3649,104 +3649,109 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
                 ]
                 // self.page_size
             ).to(device="cpu", dtype=torch.int64)
-
-            D_k_pages = None
-            if self.k_kvtc and not self.kvtc_quant_disable:
-                D_k_pages = self.quantizer.dequantize_pages_keys(
-                    host_pages,
-                    self.k_quant_buffers,
-                    self.k_quant_scales,
-                    self.k_quant_offsets,
-                )
-
-            D_v_pages = None
-            if self.v_kvtc and not self.kvtc_quant_disable:
-                D_v_pages = self.quantizer.dequantize_pages_values(
-                    host_pages,
-                    self.v_quant_buffers,
-                    self.v_quant_scales,
-                    self.v_quant_offsets,
-                )
-
-            device_pages = None
-            if D_k_pages is not None or D_v_pages is not None:
-                device_pages = (
-                    device_indices[
-                        batch_start * self.page_size : batch_end
-                        * self.page_size : self.page_size
-                    ]
-                    // self.page_size
-                ).to(device=device_pool.device, dtype=torch.int64, non_blocking=True)
-
-            if D_k_pages is not None:
-                X_k_pages = (
-                    torch.matmul(
-                        D_k_pages.flatten(0, 1).to(
-                            dtype=self.kvtc_k_V.dtype
-                        ),
-                        self.kvtc_k_V.T,
-                    )
-                    + self.kvtc_k_mu
-                )
-                batch_token_indices = token_indices[
-                    batch_start * self.page_size : batch_end * self.page_size
+            device_pages = (
+                device_indices[
+                    batch_start * self.page_size : batch_end
+                    * self.page_size : self.page_size
                 ]
-                self._rope_and_write_k_batch(
-                    device_pool,
-                    device_pages,
-                    batch_token_indices,
-                    X_k_pages,
-                    batch_end - batch_start,
-                )
+                // self.page_size
+            ).to(device=device_pool.device, dtype=torch.int64, non_blocking=True)
+            batch_token_indices = token_indices[
+                batch_start * self.page_size : batch_end * self.page_size
+            ]
 
-            if D_v_pages is not None:
-                X_v_pages = (
-                    torch.matmul(
-                        D_v_pages.flatten(0, 1).to(
-                            dtype=self.kvtc_v_V.dtype
-                        ),
-                        self.kvtc_v_V.T,
-                    )
-                    + self.kvtc_v_mu
-                )
-                device_pool.v_buffer.index_copy_(
-                    1,
-                    device_pages,
-                    X_v_pages.reshape(
-                        batch_end - batch_start,
-                        self.page_size,
-                        self.layer_num,
-                        self.head_num,
-                        self.head_dim,
-                    )
-                    .permute(2, 0, 1, 3, 4)
-                    .to(dtype=self.dtype)
-                    .contiguous(),
-                )
+            self._load_k_batch(
+                device_pool, host_pages, device_pages, batch_token_indices
+            )
+            self._load_v_batch(device_pool, host_pages, device_pages)
 
-            load_k_by_page = D_k_pages is None
-            load_v_by_page = D_v_pages is None
-            if load_k_by_page or load_v_by_page:
-                for page in range(batch_start, batch_end):
-                    batch_page = page - batch_start
-                    host_page = host_pages[batch_page]
-                    device_page = (
-                        device_indices[page * self.page_size] // self.page_size
-                    )
-                    page_token_indices = token_indices[
-                        page * self.page_size : page * self.page_size
-                        + self.page_size
-                    ]
-                    self._load_page_to_device(
-                        device_pool,
-                        host_page,
-                        device_page,
-                        page_token_indices,
-                        None,
-                        None,
-                        load_k=load_k_by_page,
-                        load_v=load_v_by_page,
-                    )
+    def _load_k_batch(
+        self,
+        device_pool,
+        host_pages: torch.Tensor,
+        device_pages: torch.Tensor,
+        batch_token_indices: torch.Tensor,
+    ) -> None:
+        if not self.k_kvtc:
+            raw_k_pages = self.k_buffer.index_select(1, host_pages).to(
+                device=device_pool.device
+            )
+            device_pool.k_buffer.index_copy_(1, device_pages, raw_k_pages)
+            return
+
+        if self.kvtc_quant_disable:
+            D_k_pages = self.k_buffer.index_select(0, host_pages).to(
+                device=device_pool.device
+            )
+        else:
+            D_k_pages = self.quantizer.dequantize_pages_keys(
+                host_pages,
+                self.k_quant_buffers,
+                self.k_quant_scales,
+                self.k_quant_offsets,
+            )
+
+        X_k_pages = (
+            torch.matmul(
+                D_k_pages.flatten(0, 1).to(dtype=self.kvtc_k_V.dtype),
+                self.kvtc_k_V.T,
+            )
+            + self.kvtc_k_mu
+        )
+        self._rope_and_write_k_batch(
+            device_pool,
+            device_pages,
+            batch_token_indices,
+            X_k_pages,
+            host_pages.numel(),
+        )
+
+    def _load_v_batch(
+        self,
+        device_pool,
+        host_pages: torch.Tensor,
+        device_pages: torch.Tensor,
+    ) -> None:
+        if not self.v_kvtc:
+            raw_v_pages = self.v_buffer.index_select(1, host_pages).to(
+                device=device_pool.device
+            )
+            device_pool.v_buffer.index_copy_(1, device_pages, raw_v_pages)
+            return
+
+        if self.kvtc_quant_disable:
+            D_v_pages = self.v_buffer.index_select(0, host_pages).to(
+                device=device_pool.device
+            )
+        else:
+            D_v_pages = self.quantizer.dequantize_pages_values(
+                host_pages,
+                self.v_quant_buffers,
+                self.v_quant_scales,
+                self.v_quant_offsets,
+            )
+
+        X_v_pages = (
+            torch.matmul(
+                D_v_pages.flatten(0, 1).to(dtype=self.kvtc_v_V.dtype),
+                self.kvtc_v_V.T,
+            )
+            + self.kvtc_v_mu
+        )
+        device_pool.v_buffer.index_copy_(
+            1,
+            device_pages,
+            X_v_pages.reshape(
+                host_pages.numel(),
+                self.page_size,
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+            )
+            .permute(2, 0, 1, 3, 4)
+            .to(dtype=self.dtype)
+            .contiguous(),
+        )
 
     def _rope_and_write_k_batch(
         self,
@@ -3779,62 +3784,6 @@ class NPUMHATokenToKVPoolCompressed(HostKVCache):
             .to(dtype=self.dtype)
             .contiguous(),
         )
-
-    def _load_page_to_device(
-        self,
-        device_pool,
-        host_page: int,
-        device_page: int,
-        page_token_indices: torch.Tensor,
-        D_k: Optional[torch.Tensor],
-        D_v: Optional[torch.Tensor],
-        load_k: bool = True,
-        load_v: bool = True,
-    ) -> None:
-        if load_k and self.k_kvtc:
-            if self.kvtc_quant_disable:
-                D_k = self.k_buffer[host_page].to(device=self.device_pool.device)
-            assert D_k is not None
-            X_k = (
-                torch.matmul(D_k.to(dtype=self.kvtc_k_V.dtype), self.kvtc_k_V.T)
-                + self.kvtc_k_mu
-            )
-            device_pool.k_buffer[:, device_page, ...] = (
-                self.rotary_emb.forward_native_keys_batch(
-                    page_token_indices,
-                    X_k.reshape(
-                        self.device_page_shape[1],
-                        self.device_page_shape[0],
-                        *self.device_page_shape[2:],
-                    ),
-                ).transpose(1, 0)
-            )
-        elif load_k:
-            device_pool.k_buffer[:, device_page, ...] = self.k_buffer[
-                :, host_page, ...
-            ].to(device=self.device_pool.device)
-
-        if load_v and self.v_kvtc:
-            if self.kvtc_quant_disable:
-                D_v = self.v_buffer[host_page].to(device=self.device_pool.device)
-            assert D_v is not None
-            X_v = (
-                (
-                    torch.matmul(
-                        D_v.to(dtype=self.kvtc_v_V.dtype), self.kvtc_v_V.T
-                    )
-                    + self.kvtc_v_mu
-                )
-                .reshape(self.page_size, self.layer_num, -1)
-                .transpose(1, 0)
-            )
-            device_pool.v_buffer[:, device_page, ...] = X_v.reshape(
-                *self.device_page_shape
-            ).to(dtype=self.dtype)
-        elif load_v:
-            device_pool.v_buffer[:, device_page, ...] = self.v_buffer[
-                :, host_page, ...
-            ].to(device=self.device_pool.device)
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, token_indices, token_io_backend

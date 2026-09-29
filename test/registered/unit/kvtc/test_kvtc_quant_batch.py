@@ -137,6 +137,158 @@ class TestKVTCQuantBatch(unittest.TestCase):
                 self.assertIs(call.args[2], getattr(pool, f"{side}_quant_scales"))
                 self.assertIs(call.args[3], getattr(pool, f"{side}_quant_offsets"))
 
+    def test_reload_raw_batches_preserve_page_order(self):
+        pool = self.make_pool()
+        pool.k_kvtc = pool.v_kvtc = False
+        pool.layer_num = 2
+        host_shape = (2, 8, 2, 1, 4)
+        pool.k_buffer = torch.arange(2 * 8 * 2 * 4).reshape(host_shape).float()
+        pool.v_buffer = pool.k_buffer + 1000
+        device = SimpleNamespace(
+            device="cpu",
+            k_buffer=torch.full((2, 5, 2, 1, 4), float("nan")),
+            v_buffer=torch.full((2, 5, 2, 1, 4), float("nan")),
+        )
+        host_pages = torch.tensor([5, 1, 3])
+        device_pages = torch.tensor([2, 4, 0])
+
+        pool.load_to_device_per_layer(
+            device,
+            self.page_indices(host_pages),
+            self.page_indices(device_pages),
+            1,
+            list(range(6)),
+            "direct",
+        )
+        self.assertTrue(torch.isnan(device.k_buffer).all())
+        self.assertTrue(torch.isnan(device.v_buffer).all())
+
+        pool.load_to_device_per_layer(
+            device,
+            self.page_indices(host_pages),
+            self.page_indices(device_pages),
+            0,
+            list(range(6)),
+            "direct",
+        )
+
+        torch.testing.assert_close(
+            device.k_buffer.index_select(1, device_pages),
+            pool.k_buffer.index_select(1, host_pages),
+        )
+        torch.testing.assert_close(
+            device.v_buffer.index_select(1, device_pages),
+            pool.v_buffer.index_select(1, host_pages),
+        )
+        self.assertTrue(torch.isnan(device.k_buffer[:, 1]).all())
+        pool.rotary_emb.forward_native_keys_batch.assert_not_called()
+        pool.quantizer.dequantize_pages_keys.assert_not_called()
+        pool.quantizer.dequantize_pages_values.assert_not_called()
+
+    def test_reload_pca_only_batches_reconstruct_and_rotate_keys(self):
+        pool = self.make_pool()
+        pool.kvtc_quant_disable = True
+        pool.kvtc_k_mu = torch.tensor([10.0, 20.0, 30.0, 40.0])
+        pool.kvtc_v_mu = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        pool.kvtc_k_V = pool.kvtc_k_V[:, :2]
+        pool.kvtc_v_V = pool.kvtc_v_V[:, :2]
+        pool.k_buffer = torch.arange(8 * 2 * 2).reshape(8, 2, 2).float()
+        pool.v_buffer = pool.k_buffer + 100
+        pool.rotary_emb.forward_native_keys_batch.side_effect = (
+            lambda positions, values: values + positions.reshape(-1, 1, 1, 1)
+        )
+        device = SimpleNamespace(
+            device="cpu",
+            k_buffer=torch.full((1, 5, 2, 1, 4), float("nan")),
+            v_buffer=torch.full((1, 5, 2, 1, 4), float("nan")),
+        )
+        host_pages = torch.tensor([5, 1, 3])
+        device_pages = torch.tensor([2, 4, 0])
+        positions = [10, 11, 30, 31, 50, 51]
+
+        pool.load_to_device_per_layer(
+            device,
+            self.page_indices(host_pages),
+            self.page_indices(device_pages),
+            0,
+            positions,
+            "direct",
+        )
+
+        projected_k = pool.k_buffer.index_select(0, host_pages)
+        projected_v = pool.v_buffer.index_select(0, host_pages)
+        expected_k = (
+            torch.cat((projected_k, torch.zeros_like(projected_k)), dim=-1)
+            + pool.kvtc_k_mu
+            + torch.tensor(positions).reshape(3, 2, 1)
+        )
+        expected_v = (
+            torch.cat((projected_v, torch.zeros_like(projected_v)), dim=-1)
+            + pool.kvtc_v_mu
+        )
+        torch.testing.assert_close(
+            device.k_buffer.index_select(1, device_pages),
+            expected_k.reshape(3, 2, 1, 1, 4).permute(2, 0, 1, 3, 4),
+        )
+        torch.testing.assert_close(
+            device.v_buffer.index_select(1, device_pages),
+            expected_v.reshape(3, 2, 1, 1, 4).permute(2, 0, 1, 3, 4),
+        )
+        self.assertEqual(pool.rotary_emb.forward_native_keys_batch.call_count, 2)
+        pool.quantizer.dequantize_pages_keys.assert_not_called()
+        pool.quantizer.dequantize_pages_values.assert_not_called()
+
+    def test_reload_pca_only_one_sided_routes_other_side_raw(self):
+        for compressed_side in ("k", "v"):
+            with self.subTest(compressed_side=compressed_side):
+                pool = self.make_pool()
+                pool.kvtc_quant_disable = True
+                pool.k_kvtc = compressed_side == "k"
+                pool.v_kvtc = compressed_side == "v"
+                raw_side = "v" if compressed_side == "k" else "k"
+                compressed_pages = torch.arange(8 * 2 * 4).reshape(8, 2, 4).float()
+                raw_pages = torch.arange(8 * 2 * 4).reshape(1, 8, 2, 1, 4).float()
+                setattr(pool, f"{compressed_side}_buffer", compressed_pages)
+                setattr(pool, f"{raw_side}_buffer", raw_pages)
+                device = SimpleNamespace(
+                    device="cpu",
+                    k_buffer=torch.full((1, 3, 2, 1, 4), float("nan")),
+                    v_buffer=torch.full((1, 3, 2, 1, 4), float("nan")),
+                )
+                host_pages = torch.tensor([5, 1])
+                device_pages = torch.tensor([2, 0])
+
+                pool.load_to_device_per_layer(
+                    device,
+                    self.page_indices(host_pages),
+                    self.page_indices(device_pages),
+                    0,
+                    [0, 1, 2, 3],
+                    "direct",
+                )
+
+                expected_compressed = (
+                    compressed_pages.index_select(0, host_pages)
+                    .reshape(2, 2, 1, 1, 4)
+                    .permute(2, 0, 1, 3, 4)
+                )
+                torch.testing.assert_close(
+                    getattr(device, f"{compressed_side}_buffer").index_select(
+                        1, device_pages
+                    ),
+                    expected_compressed,
+                )
+                torch.testing.assert_close(
+                    getattr(device, f"{raw_side}_buffer").index_select(1, device_pages),
+                    raw_pages.index_select(1, host_pages),
+                )
+                self.assertEqual(
+                    pool.rotary_emb.forward_native_keys_batch.call_count,
+                    int(compressed_side == "k"),
+                )
+                pool.quantizer.dequantize_pages_keys.assert_not_called()
+                pool.quantizer.dequantize_pages_values.assert_not_called()
+
     def test_pca_only_skips_quantizer(self):
         pool = self.make_pool()
         pool.kvtc_quant_disable = True
@@ -180,6 +332,7 @@ class TestKVTCQuantBatch(unittest.TestCase):
                     k_buffer=torch.randn(1, 3, 2, 1, 4),
                     v_buffer=torch.randn(1, 3, 2, 1, 4),
                 )
+                expected_raw = getattr(device, f"{raw_side}_buffer").clone()
                 pool.device_pool = device
                 host_indices = self.page_indices(torch.tensor([5]))
                 device_indices = self.page_indices(torch.tensor([2]))
@@ -196,6 +349,8 @@ class TestKVTCQuantBatch(unittest.TestCase):
                     pool.quantizer, f"dequantize_pages_{quantized_name}"
                 )
                 dequantize.return_value = torch.zeros(1, 2, 4)
+                device.k_buffer.fill_(float("nan"))
+                device.v_buffer.fill_(float("nan"))
                 pool.load_to_device_per_layer(
                     device, host_indices, device_indices, 0, [0, 1], "direct"
                 )
@@ -203,6 +358,10 @@ class TestKVTCQuantBatch(unittest.TestCase):
                 getattr(
                     pool.quantizer, f"dequantize_pages_{raw_name}"
                 ).assert_not_called()
+                torch.testing.assert_close(
+                    getattr(device, f"{raw_side}_buffer")[:, 2],
+                    expected_raw[:, 2],
+                )
 
     def test_empty_page_request_does_not_call_quantizer(self):
         pool = self.make_pool()
