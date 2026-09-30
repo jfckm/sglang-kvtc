@@ -555,6 +555,9 @@ class KVTCQuantizer:
                 payload = device_payloads[dtype_name].index_select(
                     1, payload_indices
                 ).reshape(1, -1)
+                # Ascend packed-INT4 anti-quantization corrupts otherwise contiguous
+                # views with nonzero storage offsets. Keep this guard after packing so
+                # the exact tensor passed to npu_anti_quant is materialized if needed.
                 if dtype_name == "int4" and payload.storage_offset() != 0:
                     payload = payload.clone()
                 expanded_scales = device_scales.index_select(
